@@ -1,0 +1,27 @@
+# llava
+LLaVA/
+
+# lmms-eval
+lmms-eval/
+
+# data
+data
+
+# logs
+logs/
+
+# checkpoints
+checkpoints/
+
+# results
+results/
+
+# wandb
+wandb/
+
+#*.egg-info
+*.egg-info/
+
+#*.pyc
+*.pyc/
+
