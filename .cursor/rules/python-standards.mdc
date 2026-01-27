@@ -1,0 +1,39 @@
+---
+description: Python style and formatting (PEP 8, imports, docstrings)
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python Style & Formatting
+
+## PEP 8 and Formatting
+
+- Follow PEP 8
+- Use 4 spaces for indentation
+- Line length: 120 characters
+- Use a formatter (e.g. black, ruff) for consistency
+
+## Import Order
+
+1. Standard library
+2. Third-party packages
+3. Local application / project modules
+
+Use a single blank line between each group.
+
+## Docstrings
+
+- Use Google-style docstrings for all public functions and classes
+- Include Args, Returns, and Raises where relevant
+
+```python
+def latency_encoding(self, latency: torch.Tensor) -> torch.Tensor:
+    """Encode latency budget into embedding space.
+
+    Args:
+        latency: Per-sample latency budget, shape [batch_size].
+
+    Returns:
+        Latency embeddings, shape [batch_size, hidden_size].
+    """
+```

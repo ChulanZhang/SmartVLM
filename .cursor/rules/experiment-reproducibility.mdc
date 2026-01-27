@@ -1,0 +1,64 @@
+---
+description: Practices for reproducible experiments and proper experiment management
+globs: src/adallava/train/**/*.py,src/adallava/eval/**/*.py,scripts/**/*.py
+alwaysApply: false
+---
+
+# Experiment Reproducibility
+
+## Random Seed Management
+
+- **Set all seeds**: Set random seeds for Python, NumPy, PyTorch, and CUDA
+- **Seed logging**: Log all random seeds used in experiments
+- **Deterministic operations**: Use `torch.use_deterministic_algorithms()` when possible
+
+```python
+# ✅ GOOD - Comprehensive seed setting
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+```
+
+## Configuration Management
+
+- **Config files**: Use YAML/JSON config files instead of hardcoded values
+- **Version control**: Track config files with git
+- **Config validation**: Validate configs at startup
+- **Override mechanism**: Allow command-line overrides for hyperparameters
+
+## Logging and Tracking
+
+- **Experiment metadata**: Log git commit, timestamp, hostname, GPU info
+- **Hyperparameters**: Log all hyperparameters used in training
+- **Metrics**: Log training and validation metrics consistently
+- **Checkpoints**: Save checkpoints with metadata (epoch, step, metrics)
+
+```python
+# ✅ GOOD - Comprehensive logging
+logger.info(f"Experiment: {config.experiment_name}")
+logger.info(f"Git commit: {get_git_commit()}")
+logger.info(f"Config: {json.dumps(config.__dict__, indent=2)}")
+logger.info(f"Device: {torch.cuda.get_device_name(0)}")
+```
+
+## Checkpointing
+
+- **Complete state**: Save model, optimizer, scheduler, random state, and config
+- **Naming convention**: Use descriptive checkpoint names with timestamps/versions
+- **Resume capability**: Ensure training can resume from checkpoints exactly
+
+## Data Handling
+
+- **Data versioning**: Track dataset versions and splits
+- **Data loading**: Use deterministic data loading (fixed workers, seeds)
+- **Preprocessing**: Document and version all data preprocessing steps
+
+## Evaluation
+
+- **Fixed evaluation sets**: Use fixed validation/test sets across experiments
+- **Evaluation metrics**: Use consistent metric computation across runs
+- **Result reporting**: Report mean and std across multiple runs when applicable

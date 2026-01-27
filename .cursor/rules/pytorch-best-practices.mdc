@@ -1,0 +1,68 @@
+---
+description: PyTorch and deep learning best practices for efficient model implementation
+globs: **/*.py
+alwaysApply: false
+---
+
+# PyTorch Best Practices
+
+## Tensor Operations
+
+- **Device management**: Always specify device explicitly, avoid implicit CPU/GPU transfers
+- **Memory efficiency**: Use in-place operations when safe (`torch.add_`, `torch.mul_`)
+- **Gradient computation**: Use `torch.no_grad()` for inference and validation
+- **Mixed precision**: Use `torch.cuda.amp` for training when appropriate
+
+```python
+# ✅ GOOD - Explicit device handling
+def forward(self, x, latency_budget):
+    x = x.to(self.device)
+    latency_emb = self.latency_encoding(latency_budget.to(self.device))
+    return self.process(x, latency_emb)
+
+# ❌ BAD - Implicit device transfers
+def forward(self, x, latency_budget):
+    return self.process(x, latency_budget)  # May cause device mismatch
+```
+
+## Model Architecture
+
+- **Module initialization**: Initialize all parameters in `__init__`, not in `forward`
+- **Shape annotations**: Add comments for tensor shapes, especially for complex operations
+- **Batch processing**: Ensure operations handle variable batch sizes correctly
+
+```python
+# ✅ GOOD - Clear shape documentation
+def latency_encoding(self, latency):
+    # latency: [batch_size]
+    # Returns: [batch_size, hidden_size]
+    quantized = latency_quantizing(latency, ...)[1]
+    scaled = quantized * 2 * torch.pi  # [batch_size]
+    frequencies = 1 / (10000 ** (torch.arange(128).to(latency.device) / 128))
+    sin_values = torch.sin(scaled[:, None] * frequencies)  # [batch_size, 128]
+    cos_values = torch.cos(scaled[:, None] * frequencies)  # [batch_size, 128]
+    return torch.cat([sin_values, cos_values], dim=1)  # [batch_size, 256]
+```
+
+## Performance Optimization
+
+- **Avoid Python loops**: Use vectorized operations instead of per-sample loops
+- **Gradient checkpointing**: Use `torch.utils.checkpoint` for memory efficiency
+- **Efficient attention**: Use optimized attention implementations when available
+- **Profiling**: Profile code to identify bottlenecks before optimizing
+
+```python
+# ✅ GOOD - Vectorized operations
+output_samples = torch.stack([sample for sample in samples])  # If necessary
+# Better: design to avoid stacking if possible
+
+# ❌ BAD - Inefficient loops
+for i in range(batch_size):
+    result[i] = process(samples[i])  # Avoid when possible
+```
+
+## Dynamic Computation
+
+- **Execution plans**: Design clear interfaces for dynamic computation paths
+- **Caching**: Cache intermediate results when computation is expensive
+- **Lazy evaluation**: Use generators or lazy tensors when appropriate

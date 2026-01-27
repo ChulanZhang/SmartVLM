@@ -1,0 +1,51 @@
+---
+description: High-quality research code standards for VLM fine-tuning project
+alwaysApply: true
+---
+
+# Research Code Standards
+
+## Code Quality Principles
+
+- **Clarity over cleverness**: Write code that is easy to understand and maintain
+- **Modularity**: Break complex logic into focused, testable functions
+- **Documentation**: Document the "why" not just the "what" - explain design decisions
+- **Reproducibility**: Ensure all experiments can be reproduced with exact configurations
+
+## Code Organization
+
+- Keep functions focused on a single responsibility
+- Use type hints for all function signatures
+- Group related functionality into logical modules
+- Separate model architecture, training logic, and evaluation code
+
+## Naming Conventions
+
+- Use descriptive names: `latency_budget` not `lb`, `compute_adjustment` not `adj`
+- Follow Python conventions: `snake_case` for variables/functions, `PascalCase` for classes
+- Prefix private methods with `_` when appropriate
+- Use meaningful names for tensor dimensions in comments
+
+## Error Handling
+
+```python
+# ✅ GOOD - Explicit error handling with context
+try:
+    execution_plan = scheduler.forward(hidden_states, latency_budget)
+except RuntimeError as e:
+    logger.error(f"Scheduler failed with latency_budget={latency_budget}: {e}")
+    raise SchedulerError(f"Unable to generate execution plan") from e
+
+# ❌ BAD - Silent failures
+try:
+    execution_plan = scheduler.forward(hidden_states, latency_budget)
+except:
+    pass
+```
+
+## Research-Specific Best Practices
+
+- **Configurability**: Use dataclasses or config objects instead of hardcoded values
+- **Logging**: Log hyperparameters, metrics, and important decisions
+- **Checkpointing**: Save model states, optimizer states, and random seeds
+- **Versioning**: Track code versions with experiments (git commits, tags)

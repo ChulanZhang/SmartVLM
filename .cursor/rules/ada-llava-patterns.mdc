@@ -1,0 +1,66 @@
+---
+description: AdaLLaVA-specific patterns for adaptive computation and latency-aware scheduling
+globs: src/adallava/**/*.py
+alwaysApply: false
+---
+
+# AdaLLaVA Architecture Patterns
+
+## Adaptive Computation Design
+
+- **Scheduler interface**: Keep scheduler interface consistent across implementations
+- **Latency encoding**: Use consistent latency encoding schemes (sinusoidal, learned, etc.)
+- **Execution plans**: Design execution plans as first-class objects with clear semantics
+
+```python
+# ✅ GOOD - Clear scheduler interface
+class SchedulerBase(nn.Module):
+    """Base class for latency-aware schedulers."""
+    def latency_encoding(self, latency: torch.Tensor) -> torch.Tensor:
+        """Encode latency budget into embedding space."""
+        raise NotImplementedError
+    
+    def forward(self, hidden_states: torch.Tensor, latency_budget: torch.Tensor) -> torch.Tensor:
+        """Generate execution plan from hidden states and latency budget."""
+        raise NotImplementedError
+```
+
+## Input Content Analysis
+
+- **Content-aware decisions**: Base computation adjustments on input complexity
+- **Feature extraction**: Extract relevant features for decision-making
+- **Adaptive thresholds**: Use learnable or configurable thresholds
+
+## Latency Budget Handling
+
+- **Normalization**: Normalize latency budgets to consistent ranges
+- **Quantization**: Use appropriate quantization for discrete execution plans
+- **Validation**: Validate latency budgets are within acceptable ranges
+
+```python
+# ✅ GOOD - Robust latency handling
+def forward(self, x, latency):
+    # Validate and normalize latency budget
+    latency = torch.clamp(latency, 0.0, 1.0)
+    latency = latency_quantizing(
+        latency, 
+        self.num_prefix_layers, 
+        self.num_hidden_layers
+    )[0]
+    
+    # Generate execution plan
+    logits = self.mlp_head(x)
+    return self._sample_execution_plan(logits, latency)
+```
+
+## Model Components
+
+- **Modular design**: Keep scheduler, encoder, and language model components separate
+- **Configuration**: Use config objects to manage hyperparameters
+- **Extensibility**: Design for easy addition of new scheduler types or strategies
+
+## Cache Management
+
+- **Dynamic caching**: Use dynamic caches that respect execution plans
+- **Memory efficiency**: Implement efficient cache update strategies
+- **State management**: Track cache state across forward passes
