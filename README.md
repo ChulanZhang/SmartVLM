@@ -50,7 +50,7 @@ pip install -e .
 cd ..
 ```
 
-4. Install LLaVa
+4. Install LLaVA (required for training)
 ```Shell
 git clone https://github.com/haotian-liu/LLaVA.git
 cd LLaVA
@@ -68,6 +68,8 @@ cd ..
 ```Shell
 pip install -e .
 ```
+
+On some clusters, `source activate_env.sh` loads modules and sets `HF_HOME` for the Hugging Face cache (e.g. model/tokenizer downloads).
 
 ### Quick Start
 
@@ -171,17 +173,30 @@ where `SRC` is the json file under `./logs_0.85_vqav2/submission/`, `DST` is the
 Submit the converted submission file to [VQA Challenge 2021](https://eval.ai/web/challenges/challenge-page/830/overview).
 
 
-### Evaluate using original LLaVA-1.5 evaluation script
-See [`Evaluation_LLaVA.md`](docs/Evaluation_LLaVA.md)
+### LLaVA-style scripts (optional, no FLOPs)
+For custom jsonl or submission-only workflows (e.g. VQAv2 via `model_vqa_loader`), see [Evaluation_LLaVA.md](docs/Evaluation_LLaVA.md). FLOPs and efficiency metrics are reported only when using lmms-eval.
+
+### Adaptive vision token scheduler (Exp1) via lmms-eval
+For checkpoints trained with `token_selecting=adaptive`, pass `token_budget` in `model_args` (ratio in [0,1]; 1.0 = full tokens). The adallava wrapper uses it when the model has a vision token controller:
+
+```bash
+python3 -m accelerate.commands.launch \
+    -m adallava.eval.run_lmms_eval \
+    --model adallava \
+    --model_args pretrained=path/to/adaptive-ckpt,token_budget=0.5,latency=1.0 \
+    --tasks mme,pope,mmbench_en_dev \
+    --batch_size 1 \
+    --output_path ./logs_adaptive_0.5/
+```
 
 ## Train
 
 
 ### Prepare data
 Follow instructions from [here](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#visual-instruction-tuning) to download images from these 5 datasets for LLaVA v1.5 fine-tuning. Put the zip files in the corresponding folders and unzip them. 
-image path:
+Default layout under `./data/` (override via `--data_path` / `--image_folder` in scripts):
 ```bash
-LLaVA-Finetune
+data/
 ├── images
 │   ├── coco
 │   │   └── train2017
@@ -196,7 +211,7 @@ LLaVA-Finetune
 │       └── VG_100K_2
 └── llava_v1_5_mix665k.json
 ```
-download instruction tuning data from [here](https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/blob/main/llava_v1_5_mix665k.json) into `./LLaVA-Finetune/llava_v1_5_mix665k.json`.
+Download instruction tuning data from [here](https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K/blob/main/llava_v1_5_mix665k.json) into `./data/llava_v1_5_mix665k.json`. Training scripts default to `--data_path ./data/llava_v1_5_mix665k.json` and `--image_folder ./data/images`. For evaluation (e.g. VQAv2), use `./data/eval/`; see [Evaluation_LLaVA.md](docs/Evaluation_LLaVA.md). The `playground/` path is legacy.
 
 ### Joint training of model and scheduler
 Our training directly follow original LLaVA repository *stage-2:Visual Instruction Tuning*.  We load pretrained checkpoint of llava 1.5 and random initilize weights for scheduler.

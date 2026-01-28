@@ -1,0 +1,11 @@
+---
+description: Use lowercase for paths and output directories; avoid uppercase unless necessary.
+globs: "**/*.sh,scripts/**/*.py,src/**/*.py"
+alwaysApply: false
+---
+
+# Path Conventions
+
+- **Lowercase paths**: Use lowercase for output paths, data paths, and directory names (e.g. `data/eval/`, `output_base`, `checkpoints/`). Do not use uppercase env-style names like `OUTPUT_BASE` or `MODEL_PATH` in default path strings or in scripts unless required by an external tool.
+- **Consistency**: When adding new scripts or configs, prefer lowercase variable names for paths (e.g. `output_base`, `model_path`, `question_file`, `image_folder`) and default path strings in lowercase.
+- **Exceptions**: Uppercase is acceptable when (1) an external tool mandates it (e.g. `CUDA_VISIBLE_DEVICES`), or (2) a documented env var is intentionally uppercase for user override (e.g. `model_path` can be overridden by user with `export model_path=...`; keep the default value and any path literals in lowercase).

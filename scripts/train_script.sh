@@ -9,8 +9,8 @@ deepspeed ./src/adallava/train/train_mem.py \
     --deepspeed ./LLaVA/scripts/zero3.json \
     --model_name_or_path  ${original_model}\
     --version v1 \
-    --data_path ./LLaVA-FineTune/llava_v1_5_mix665k.json \
-    --image_folder ./LLaVA-FineTune/images \
+    --data_path ./data/llava_v1_5_mix665k.json \
+    --image_folder ./data/images \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \

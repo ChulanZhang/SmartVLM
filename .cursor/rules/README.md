@@ -29,6 +29,9 @@ This directory contains Cursor AI rule files that provide project-specific conte
    - Configuration management
    - Logging and checkpointing best practices
 
+6. **path-conventions.mdc** (globs: **/*.sh, scripts/**/*.py, src/**/*.py)
+   - Use lowercase for paths and output directories; avoid uppercase unless necessary
+
 ## Rule File Format
 
 Rule files use `.mdc` format with YAML frontmatter and Markdown content:
