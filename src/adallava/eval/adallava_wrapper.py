@@ -65,6 +65,7 @@ class AdaLlava(Llava):
         device_map="cuda:0",
         conv_template="vicuna_v1",
         latency=1.0,
+        token_budget=1.0,
         use_cache=True,
         tie_weights: bool = True,
         truncate_context=False,  # whether to truncate the context in generation, set it False for LLaVA-1.6
@@ -116,6 +117,7 @@ class AdaLlava(Llava):
         self.use_cache = use_cache
         self.truncate_context = truncate_context
         self.latency = latency
+        self.token_budget = token_budget
         # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [DistributedType.FSDP, DistributedType.MULTI_GPU, DistributedType.DEEPSPEED], "Unsupported distributed type provided. Only DDP and FSDP are supported."
@@ -249,8 +251,9 @@ class AdaLlava(Llava):
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
-            # These steps are not in LLaVA's original code, but are necessary for generation to work
-            # TODO: attention to this major generation step...
+            # For adaptive vision token scheduler (Exp1), set token budget before encode/generate
+            if getattr(self.model, "vision_token_controller", None) is not None:
+                self.model.current_token_budget = self.token_budget
             try:
                 outputs = self.model.generate(
                     input_ids,

@@ -91,6 +91,9 @@ def eval_model(args):
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, **llava_model_args)
     model = model.to(torch.float16)  ## need to do again for CLIP ViT
 
+    if getattr(args, "token_budget", None) is not None and hasattr(model, "current_token_budget"):
+        model.current_token_budget = args.token_budget
+
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
@@ -160,6 +163,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--model-name", type=str, default=None)
     parser.add_argument("--latency", type=float, default=None)
+    parser.add_argument(
+        "--token_budget",
+        type=float,
+        default=None,
+        help="Vision token budget ratio in [0,1] for token_selecting='adaptive' models.",
+    )
     args = parser.parse_args()
 
     eval_model(args)

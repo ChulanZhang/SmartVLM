@@ -1,5 +1,10 @@
 #!/bin/bash
+# Wandb: run once to log in: wandb login
+# Optional: export WANDB_API_KEY=your_key      (if you cannot run wandb login)
 export WANDB_PROJECT=adallava
+# Uncomment one to choose where runs are logged:
+# export WANDB_ENTITY=pengchengwang92                    # personal account
+# export WANDB_ENTITY=pengchengwang92-purdue-university  # team (default if logged in via team)
 RUN_NUM=""
 
 
@@ -25,8 +30,8 @@ deepspeed ./src/adallava/train/train_mem.py \
     --scheduler_type "L" \
     --output_dir checkpoints/ada-llava-L-v1.5-7b \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 16 \
+    --gradient_accumulation_steps 2 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \
@@ -41,5 +46,5 @@ deepspeed ./src/adallava/train/train_mem.py \
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
-    --report_to none \
+    --report_to wandb \
     --run_name ada-llava-L-v1.5-7b${RUN_NUM} \

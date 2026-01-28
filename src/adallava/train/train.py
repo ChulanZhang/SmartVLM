@@ -67,9 +67,16 @@ class ModelArguments:
 
     # AdaLLaVA arguments
     num_prefix_layers: Optional[int] = field(default=16)
-    token_selecting: Optional[str] = field(default='none'), # 'none', 'prumerge', 'prumerge+',
-    scheduler_type: Optional[str] = field(default='L') # 'L', 'H',
-    scheduler_rank: Optional[int] = field(default=8) #sampling group size for AdaLLaVa-H#
+    token_selecting: Optional[str] = field(default='none')  # 'none', 'prumerge', 'prumerge+', 'adaptive'
+    scheduler_type: Optional[str] = field(default='L')  # 'L', 'H'
+    scheduler_rank: Optional[int] = field(default=8)  # sampling group size for AdaLLaVA-H
+
+    # Vision token scheduler (Exp1, token_selecting='adaptive')
+    vision_controller_budget_min: Optional[float] = field(default=0.2)
+    vision_controller_budget_max: Optional[float] = field(default=1.0)
+    vision_controller_tau: Optional[float] = field(default=5.0)
+    num_vision_patches: Optional[int] = field(default=576)  # e.g. 24*24 for ViT 336
+    mm_hidden_size: Optional[int] = field(default=1024)  # vision encoder hidden size (ViT-L)
 
 
 @dataclass
@@ -837,6 +844,15 @@ def train(attn_implementation=None):
                 token_selecting=model_args.token_selecting,
                 scheduler_type=model_args.scheduler_type,
                 scheduler_rank=model_args.scheduler_rank,
+                vision_controller_budget_min=getattr(
+                    model_args, "vision_controller_budget_min", 0.2
+                ),
+                vision_controller_budget_max=getattr(
+                    model_args, "vision_controller_budget_max", 1.0
+                ),
+                vision_controller_tau=getattr(model_args, "vision_controller_tau", 5.0),
+                num_vision_patches=getattr(model_args, "num_vision_patches", 576),
+                mm_hidden_size=getattr(model_args, "mm_hidden_size", None),
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args

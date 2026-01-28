@@ -38,15 +38,25 @@ class AdaLlavaConfig(AdaLlamaConfig):
 
     def __init__(
         self,
-        token_selecting = "none", # "none", "prumerge", "prumerge+",
-        scheduler_type = "L", # "L", "H",
-        scheduler_rank = 8,
+        token_selecting="none",  # "none", "prumerge", "prumerge+", "adaptive"
+        scheduler_type="L",  # "L", "H"
+        scheduler_rank=8,
+        vision_controller_budget_min=0.2,
+        vision_controller_budget_max=1.0,
+        vision_controller_tau=5.0,
+        num_vision_patches=576,
+        mm_hidden_size=None,  # vision encoder hidden size (e.g. 1024 for ViT-L); set from tower if None
         **kwargs
-    ):  
+    ):
         super().__init__(**kwargs)
         self.token_selecting = token_selecting
         self.scheduler_type = scheduler_type
         self.scheduler_rank = scheduler_rank
+        self.vision_controller_budget_min = vision_controller_budget_min
+        self.vision_controller_budget_max = vision_controller_budget_max
+        self.vision_controller_tau = vision_controller_tau
+        self.num_vision_patches = num_vision_patches
+        self.mm_hidden_size = mm_hidden_size
 
 
 class AdaLlavaLlamaModel(LlavaMetaModel, AdaLlamaModel):
@@ -67,20 +77,55 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        if self.config.scheduler_type == 'L':
+        if self.config.scheduler_type == "L":
             self.scheduler = SimpleScheduler_L(config)
-        elif self.config.scheduler_type == 'H':
+        elif self.config.scheduler_type == "H":
             self.scheduler = SimpleScheduler_H(config)
         else:
             raise NotImplementedError
-        
+
+        if getattr(config, "token_selecting", "none") == "adaptive":
+            from .multimodal_encoder.budget_embedding import BudgetEmbedding
+            from .multimodal_encoder.vision_token_controller import VisionTokenController
+
+            vision_dim = getattr(config, "mm_hidden_size", 1024)
+            num_patches = getattr(config, "num_vision_patches", 576)
+            tau = getattr(config, "vision_controller_tau", 5.0)
+            # When mm_vision_select_feature == "cls_patch", vision_tower returns [B, N+1, C];
+            # use_cls=True so controller keeps CLS and selects among N patches -> output [B, N+1, C].
+            # When "patch" (default), vision_tower returns [B, N, C]; use_cls=False -> output [B, N, C].
+            use_cls = getattr(config, "mm_vision_select_feature", "patch") == "cls_patch"
+            self.budget_embedding = BudgetEmbedding(
+                dim_out=vision_dim, num_freqs=128, hidden_dim=256
+            )
+            self.vision_token_controller = VisionTokenController(
+                vision_dim=vision_dim,
+                num_patches=num_patches,
+                tau=tau,
+                use_cls=use_cls,
+            )
+        else:
+            self.budget_embedding = None
+            self.vision_token_controller = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_model(self):
         return self.model
     
-    def encode_images(self, images):
+    def _get_token_budget(self, batch_size: int) -> torch.Tensor:
+        """Sample token budget (ratio in [min, max]) for training. Used when token_selecting=='adaptive'.
+
+        Note: returning per-sample budgets is fine because we do not change the module execution order
+        (we only mask patch features to 0). This matches AdaLLaVA's training where latency is per-sample.
+        """
+        min_r = getattr(self.config, "vision_controller_budget_min", 0.2)
+        max_r = getattr(self.config, "vision_controller_budget_max", 1.0)
+        device = next(self.parameters()).device
+        return torch.rand(batch_size, device=device, dtype=self.dtype) * (max_r - min_r) + min_r
+
+    def encode_images(self, images, token_budget: Optional[torch.Tensor] = None, **kwargs):
         if type(images) is list or self.config.token_selecting == "none":
             return super().encode_images(images)
         elif self.config.token_selecting == "prumerge":
@@ -89,6 +134,42 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         elif self.config.token_selecting == "prumerge+":
             vision_tower = self.get_model().get_vision_tower()
             image_features = prune_merge_plus(vision_tower, images).to(self.dtype)
+        elif self.config.token_selecting == "adaptive":
+            vision_tower = self.get_model().get_vision_tower()
+            images_in = images.to(device=self.device, dtype=self.dtype)
+            # IMPORTANT for ZeRO-3 stability:
+            # Do NOT call the inner transformers CLIPVisionModel directly here because it returns a
+            # ModelOutput object. DeepSpeed ZeRO-3 parameter offload hooks sometimes cannot detect
+            # tensors embedded in custom output objects, leading to "Invalidate trace cache" /
+            # "still have inflight params".
+            #
+            # Instead, call LLaVA's CLIPVisionTower wrapper, which returns a plain Tensor.
+            # Shape: [B, N, C] if mm_vision_select_feature=='patch', [B, N+1, C] if 'cls_patch'.
+            vision_output = vision_tower(images_in).to(self.dtype)
+
+            batch_size = vision_output.size(0)
+            if token_budget is None:
+                if self.training:
+                    token_budget = self._get_token_budget(batch_size)
+                else:
+                    tb = getattr(self, "current_token_budget", None)
+                    if tb is not None:
+                        if isinstance(tb, (int, float)):
+                            token_budget = torch.full(
+                                (batch_size,), float(tb), device=self.device, dtype=self.dtype
+                            )
+                        else:
+                            token_budget = tb if tb.numel() >= batch_size else tb.expand(batch_size)
+                    else:
+                        token_budget = torch.full(
+                            (batch_size,), 1.0, device=self.device, dtype=self.dtype
+                        )
+            budget_emb = self.budget_embedding(token_budget)
+            selected, _ = self.vision_token_controller(
+                vision_output, token_budget, budget_embedding=budget_emb
+            )
+            image_features = self.get_model().mm_projector(selected)
+            return image_features
         else:
             raise NotImplementedError
         image_features = self.get_model().mm_projector(image_features)
