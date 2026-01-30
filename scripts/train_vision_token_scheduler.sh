@@ -1,17 +1,23 @@
 #!/bin/bash
 # Train the vision token scheduler (Exp1: adaptive vision token prune).
 # Uses token_selecting="adaptive"; vision controller is trained with random token budget per batch.
+# freeze_llm_scheduler=True: run full LLM (no latency token, no layer/head skip), like standard LLaVA;
+# only the vision token controller is trained. Use when starting from LLaVA (no AdaLLaVA scheduler).
 # See docs/EXP1_ADAPTIVE_VISION_TOKEN_PRUNE_IMPLEMENTATION.md and README.md for data setup.
+#
+# Activate environment first if needed: source activate_env.sh
 #
 # Wandb: run once to log in: wandb login
 # Optional: export WANDB_API_KEY=your_key      (if you cannot run wandb login)
-export WANDB_PROJECT=adallava
+export WANDB_PROJECT=adallava-vision-token-scheduler
 # Uncomment one to choose where runs are logged:
 # export WANDB_ENTITY=pengchengwang92                    # personal account
-# export WANDB_ENTITY=pengchengwang92-purdue-university  # team (default if logged in via team)
-RUN_NUM=""
+export WANDB_ENTITY=pengchengwang92-purdue-university  # team (default if logged in via team)
 
 original_model="liuhaotian/llava-v1.5-7b"
+# Customize RUN_NAME based on your configuration (e.g., budget range, learning rate, etc.)
+RUN_NAME="ada-llava-vision-token-scheduler-v1.5-7b"
+OUTPUT_DIR="checkpoints/${RUN_NAME}"
 
 deepspeed ./src/adallava/train/train_mem.py \
     --deepspeed ./LLaVA/scripts/zero3.json \
@@ -36,7 +42,8 @@ deepspeed ./src/adallava/train/train_mem.py \
     --vision_controller_tau 5.0 \
     --num_vision_patches 576 \
     --mm_hidden_size 1024 \
-    --output_dir checkpoints/ada-llava-vision-token-scheduler-v1.5-7b \
+    --freeze_llm_scheduler True \
+    --output_dir "$OUTPUT_DIR" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 2 \
@@ -44,7 +51,7 @@ deepspeed ./src/adallava/train/train_mem.py \
     --save_strategy "steps" \
     --save_steps 500 \
     --save_total_limit 1 \
-    --learning_rate 1e-5 \
+    --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
@@ -55,4 +62,4 @@ deepspeed ./src/adallava/train/train_mem.py \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name ada-llava-vision-token-scheduler-v1.5-7b${RUN_NUM} \
+    --run_name "$RUN_NAME" \

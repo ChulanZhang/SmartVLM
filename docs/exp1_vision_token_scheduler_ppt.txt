@@ -1,0 +1,68 @@
+========================================
+Adaptive Vision Token Scheduler
+Exp1: Dynamic Token Pruning for Efficient MLLMs
+========================================
+
+【Core Design: Two-Path Selection Mechanism】
+
+Path 1: Which tokens to select?
+  • Budget Token injected INTO Vision Encoder
+  • Budget token attends with all patches through ViT layers
+  • Budget and content fuse via self-attention inside encoder
+  • Controller uses fused representation for per-patch logits
+
+Path 2: How many tokens to select?
+  • Budget ratio b → count K = ⌊b × N⌋
+  • Gumbel-Softmax top-K: exactly K patches selected
+  • Budget directly controls the number
+
+【Architecture Flow】
+
+Images → Patch Embedding → [CLS, P_1, ..., P_N, BUDGET] → ViT Encoder → Token Controller → Selected K Tokens → LLM
+                              ↑
+                    Budget Embedding (Budget b) injected before ViT
+
+【Core Components】
+
+1. Budget Embedding & Injection
+   • Input: Scalar budget b ∈ [0,1] (ratio)
+   • Method: Sinusoidal encoding + MLP → [B, C_v]
+   • Injection: Append budget token after patch embedding: [CLS, P_1, ..., P_N, BUDGET]
+   • Position: Extended position embeddings for budget token
+   • Shape: Input [B, N+1, C_v] → With budget [B, N+2, C_v] → After ViT [B, N+2, C_v]
+
+2. Vision Token Controller
+   • Input: Vision encoder output [B, N+2, C_v] (last position = budget token output, fused with all patches via ViT)
+   • Method: Only budget token output → one linear Linear(C_v, N) → per-patch logits → Gumbel-Softmax top-K (AdaLLaVA-style)
+   • Output: Fixed shape [B, N, C_v] (unselected tokens masked to 0)
+
+【Training】
+
+• Loss: Language Modeling Loss only (no FLOPs regularization)
+• Budget sampling: Random b ~ Uniform[0.2, 1.0] per batch
+• End-to-end differentiable: Gumbel-Softmax + Straight-through estimator
+
+【Key Features】
+
+✓ In-encoder fusion: Budget token passes through entire ViT, enabling deep interaction with patches
+✓ Content-aware: Selection adapts to image content via self-attention between budget and patches
+✓ Budget-controlled: Fine-grained efficiency-accuracy trade-off
+✓ Fixed dimensions: Output maintains [B, N, C_v], avoiding dynamic sequence length issues
+✓ ZeRO-3 compatible: Stable training with DeepSpeed ZeRO-3 (fixed execution order)
+
+【Evaluation Setup】
+
+• Multiple fixed budgets: K ∈ {115, 230, 345, 460, 576} (20%-100%)
+• Baselines: Full LLaVA, PruMerge, FastV
+• Metrics: Accuracy-FLOPs curves
+
+【Technical Details】
+
+• Budget injection: After patch+CLS embedding, before ViT transformer layers
+• Sequence length: [CLS, P_1, ..., P_N, BUDGET] → N+2 tokens through ViT
+• Position embeddings: Extended by one learned vector for budget token position
+• Budget token output: Last position [B, N+2, C_v][:, -1, :] contains fused representation
+• Compatibility: Fully compatible with LLaVA's mm_projector and downstream components
+• Stability: Fixed module execution order avoids DeepSpeed ZeRO-3 "inflight params" errors
+
+========================================

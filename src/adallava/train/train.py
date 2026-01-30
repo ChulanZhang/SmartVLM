@@ -77,6 +77,10 @@ class ModelArguments:
     vision_controller_tau: Optional[float] = field(default=5.0)
     num_vision_patches: Optional[int] = field(default=576)  # e.g. 24*24 for ViT 336
     mm_hidden_size: Optional[int] = field(default=1024)  # vision encoder hidden size (ViT-L)
+    # When True and token_selecting='adaptive': run full LLM (no layer/head skip), no latency token;
+    # only the vision token controller is trained. Use this when training from LLaVA (no AdaLLaVA
+    # scheduler): execution plan = run all layers/heads, like standard LLaVA.
+    freeze_llm_scheduler: bool = field(default=False)
 
 
 @dataclass
@@ -806,6 +810,34 @@ def train(attn_implementation=None):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    # Save initial config/args for reproducibility (only on main process)
+    if training_args.local_rank in (-1, 0):
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        import dataclasses, json, subprocess, platform
+        try:
+            with open(os.path.join(training_args.output_dir, "model_args.json"), "w") as f:
+                json.dump(dataclasses.asdict(model_args), f, indent=2)
+            with open(os.path.join(training_args.output_dir, "data_args.json"), "w") as f:
+                json.dump(dataclasses.asdict(data_args), f, indent=2)
+            with open(os.path.join(training_args.output_dir, "training_args.json"), "w") as f:
+                json.dump(dataclasses.asdict(training_args), f, indent=2)
+        except Exception as e:
+            rank0_print(f"Warning: failed to write args to {training_args.output_dir}: {e}")
+        # record git commit
+        try:
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+            with open(os.path.join(training_args.output_dir, "git_commit.txt"), "w") as f:
+                f.write(commit)
+        except Exception:
+            pass
+        # environment info
+        try:
+            with open(os.path.join(training_args.output_dir, "env_info.txt"), "w") as f:
+                f.write(f"platform: {platform.platform()}\n")
+                f.write(f"python: {platform.python_version()}\n")
+                f.write(f"torch: {torch.__version__}\n")
+        except Exception:
+            pass
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -853,6 +885,7 @@ def train(attn_implementation=None):
                 vision_controller_tau=getattr(model_args, "vision_controller_tau", 5.0),
                 num_vision_patches=getattr(model_args, "num_vision_patches", 576),
                 mm_hidden_size=getattr(model_args, "mm_hidden_size", None),
+                freeze_llm_scheduler=getattr(model_args, "freeze_llm_scheduler", False),
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
@@ -870,6 +903,13 @@ def train(attn_implementation=None):
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
+
+    # When training only the vision token scheduler (freeze_llm_scheduler + adaptive), we run
+    # full LLM (no scheduler call) and freeze the LLM scheduler params so they are not trained.
+    if getattr(model_args, "token_selecting", "none") == "adaptive" and getattr(
+        model_args, "freeze_llm_scheduler", False
+    ) and hasattr(model, "scheduler"):
+        model.scheduler.requires_grad_(False)
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
@@ -995,6 +1035,27 @@ def train(attn_implementation=None):
     else:
         trainer.train()
     trainer.save_state()
+    # DeepSpeed ZeRO-3: all ranks must call save_model (collective); only rank 0 does file-only writes.
+    try:
+        trainer.save_model(training_args.output_dir)
+    except Exception as e:
+        rank0_print(f"Warning: trainer.save_model failed: {e}; falling back to model.save_pretrained")
+        try:
+            model.save_pretrained(training_args.output_dir)
+        except Exception as e2:
+            rank0_print(f"Warning: model.save_pretrained also failed: {e2}")
+    if training_args.local_rank in (-1, 0):
+        try:
+            model.config.save_pretrained(training_args.output_dir)
+        except Exception as e:
+            rank0_print(f"Warning: failed to save model.config: {e}")
+        try:
+            import dataclasses
+            import json
+            with open(os.path.join(training_args.output_dir, "training_args_final.json"), "w") as f:
+                json.dump(dataclasses.asdict(training_args), f, indent=2)
+        except Exception as e:
+            rank0_print(f"Warning: failed to write final training args: {e}")
 
     model.config.use_cache = True
 

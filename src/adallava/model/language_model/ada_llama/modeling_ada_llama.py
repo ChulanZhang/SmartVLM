@@ -338,8 +338,12 @@ class AdaLlamaModel(LlamaModel):
                 if latency is not None:
                     latency_token = hidden_states[torch.arange(hidden_states.size(0)), latency_token_position]
                     execution_plan = scheduler(latency_token.contiguous(), latency).transpose(0, 1)
-                else:
+                elif past_key_values is not None and hasattr(past_key_values, "get_execution_plan"):
                     execution_plan = past_key_values.get_execution_plan()
+                else:
+                    # Training with full LLM (e.g. freeze_llm_scheduler + adaptive): no scheduler call,
+                    # run all layers and heads (drop_states = None for every layer).
+                    execution_plan = [None] * self.config.num_hidden_layers
 
             if execution_plan is not None and idx >= self.config.num_prefix_layers:
                 drop_states = execution_plan[idx]

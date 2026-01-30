@@ -39,7 +39,7 @@ We mirror this on the vision side:
 1. **Budget token and fusion**  
    A **budget token** is added to the vision encoder’s **input** sequence (e.g. appended after CLS and patch tokens). “Appended at the end” here means: it is the **last position** of the sequence fed into the encoder. That sequence is then passed through the ViT’s transformer layers, so the budget token attends to all vision tokens and vice versa in every layer. Putting it at the beginning `[BUDGET, CLS, P_1, ..., P_N]` would also allow full fusion; we default to append.  
    The controller is fed the vision encoder output (including the budget token’s representation). So:
-   - **Path 1:** The representation used to compute keep-logits is budget- and content-aware (either from in-encoder fusion, or from a post-encoder budget–vision fusion in a lighter variant).
+   - **Path 1:** The representation used to compute keep-logits is budget- and content-aware (budget token is inside the ViT and fuses with all patches via self-attention).
    - **Path 2:** A scalar token budget K (or ratio r) is used to choose **how many** vision tokens to keep via Gumbel top-K, in the same way latency is used in AdaLLaVA.
 
 2. **Token-level controller**  
@@ -49,18 +49,13 @@ We mirror this on the vision side:
    `images → vision encoder (with optional budget token) → controller(vision_output, token_budget) → selected [B, 1+K, C_v] → mm_projector → LLM`.  
    For compatibility with LLaVA’s multimodal path, we can fix the number of output tokens per run (e.g. always 1+K for a chosen K), or pad/truncate to a fixed length in a first version.
 
-### 2.3 Option A vs Option B (where budget and vision fuse)
+### 2.3 Budget inside the encoder
 
-The vision encoder (e.g. CLIP ViT) does: **patch embed → position embed → transformer layers → output**. Every token in the input sequence attends to the whole sequence in each layer.
+The vision encoder (e.g. CLIP ViT) does: **patch embed → position embed → transformer layers → output**. We append one budget embedding after patch (and CLS) so the sequence is `[CLS, P_1, ..., P_N, BUDGET]` with shape `[B, N+2, C_v]`. This is fed through the **same** ViT transformer stack. The budget token’s output is then a representation that has already interacted with all patches over all layers. Fusion happens **inside** the ViT via self-attention.
 
-- **Option A — Budget inside the encoder:**  
-  After patch (and CLS) embedding, we append one budget embedding so the sequence is `[CLS, P_1, ..., P_N, BUDGET]` with shape `[B, N+2, C_v]`. This is fed through the **same** ViT transformer stack. The budget token’s output is then a representation that has already interacted with all patches over all layers. Fusion happens **inside** the ViT via self-attention.
+The controller takes **only** this budget token output (last position) and one linear `Linear(C_v, N)` → per-patch logits `[B, N]`, same design as AdaLLaVA’s scheduler: one fused vector → `mlp_head` → per-item logits. Code: `vision_encoder_with_budget` returns `[B, N+2, C]`; `vision_token_controller` uses `vision_output[:, -1, :]` and `logit_head(budget_repr)`.
 
-- **Option B — Budget only after the encoder:**  
-  The ViT is run as usual on `[CLS, P_1, ..., P_N]` → `[B, N+1, C_v]`. We do **not** add a token inside the ViT. We only compute a budget embedding from the scalar (e.g. sinusoidal + MLP) and fuse it with vision in a **separate** step after the encoder (e.g. one cross-attention: budget as query, vision tokens as key/value). The controller then uses this fused representation plus per-patch features to produce keep logits.  
-  So “how many” is still set by the scalar K (Path 2). “Which” (the logits) is informed by content and by the post-encoder–fused budget (Path 1), but the budget never goes through the ViT.
-
-Implementation order: **Phase 1** uses Option B (minimal changes to the vision tower). **Phase 2** switches to Option A for full in-encoder fusion and compares to Phase 1.
+**AdaLLaVA scheduler (for reference):** The LLM-side scheduler takes **only** the latency token’s hidden state `x` after prefix layers; `logits = self.mlp_head(x)` with `mlp_head = nn.Linear(hidden_size, num_sub_layer)` — a single linear layer. We mirror this: budget token output → `Linear(C_v, N)` → per-patch logits.
 
 ---
 
@@ -68,23 +63,31 @@ Implementation order: **Phase 1** uses Option B (minimal changes to the vision t
 
 ### 3.1 Vision encoder and budget token
 
-- **Where to inject (Option A):** One extra token after patch+CLS embedding, i.e. last position of the encoder input. Sequence length becomes N+2; we extend position embeddings by one (e.g. one learned vector for that position).
-- **Budget embedding:** Scalar budget b ∈ [0,1] (or discrete K). Encode like AdaLLaVA’s scheduler: sinusoidal over 256 dims then MLP to `C_v`, so we get `[B, 1, C_v]`. Option B uses the same encoding but only in the post-encoder fusion step.
-- **Shapes:** Patch+CLS → `[B, N+1, C_v]`; with budget → `[B, N+2, C_v]`; after ViT → `[B, N+2, C_v]`. For the controller we only predict keep/drop for the first N+1 (or N patches if CLS is always kept).
+- **C_v:** Vision encoder hidden dimension (e.g. 1024 for ViT-L; same as `mm_hidden_size`).
+- **Where to inject:** One extra token after patch+CLS embedding, i.e. last position of the encoder input. Sequence length becomes N+2; we extend position embeddings by one (e.g. one learned vector for that position).
+- **Budget embedding:** Scalar budget b ∈ [0,1] (or discrete K). Encode like AdaLLaVA’s scheduler: sinusoidal over 256 dims then MLP to `C_v`, so we get `[B, 1, C_v]`; this is appended to the patch sequence before the ViT.
+- **Shapes:** Patch+CLS → `[B, N+1, C_v]`; with budget → `[B, N+2, C_v]`; after ViT → `[B, N+2, C_v]`. The controller predicts keep/drop only for the N patches; CLS and budget token are not sent to the projector.
+- **Pipeline unchanged:** Controller output is always `[B, N, C_v]` (only N patch tokens) so mm_projector and LLM receive the same token count as LLaVA; projector input size stays fixed.
 
 ### 3.2 Token-level controller
 
-- **Inputs:** `vision_output` `[B, N+2, C_v]` (Option A) or `[B, N+1, C_v]` plus a separate budget vector (Option B); and `token_budget` (scalar K or ratio r, or per-batch).
-- **Logits:** One linear `C_v → 1` over the patch tokens (or over N+1 if we include CLS in the prediction), optionally conditioned on the budget token / budget embedding (e.g. concat or dot-product). Output shape `[B, N]` over patches.
+- **Inputs:** `vision_output` `[B, N+2, C_v]` (last position = budget token output); and `token_budget` (scalar K or ratio r, or per-batch).
+- **Logits:** Only the budget token output (last position) → one linear `Linear(C_v, N)` → per-patch logits `[B, N]`. No concat with patch tokens (AdaLLaVA-style).
 - **Discrete selection:** Reuse AdaLLaVA’s Gumbel top-k: `masked_gumbel_softmax_topk` or a loop of `n_times_gumbel_softmax` to select exactly K patches. Training: hard Gumbel with straight-through; inference: hard top-K.
-- **Output:** Mask or indices for K patches; then `[CLS; selected K patches]` → `[B, 1+K, C_v]` before mm_projector.
+- **Output:** Mask or indices for K patches. We output fixed `[B, N, C_v]` (N patch positions, unselected masked to 0) so mm_projector input size is unchanged; no CLS token is passed to the projector.
 
 ### 3.3 Training and evaluation
 
 - **Training:** Same as AdaLLaVA: **only LM loss**. Each batch samples a random token budget K (or r mapped to K), e.g. from a uniform over a range. The controller receives that K and must choose exactly K patches via Gumbel; no extra FLOPs or budget regularizer in the baseline. The comparison with “no token prune” is done **at evaluation time** by plotting accuracy vs. FLOPs and comparing to full LLaVA, PruMerge, and FastV, not by an extra loss term.
 - **Evaluation:** Run at several fixed K (e.g. 64, 128, 256, 384, 576). For each K, compute accuracy and FLOPs. FLOPs in Exp1 are dominated by **sequence length** (vision token count + text length) because we keep LLM width and depth fixed; we use vision_encoder (fixed) + mm_projector(∝ K) + LLM(∝ seq_len) to form the accuracy–FLOPs curve.
 
-### 3.4 Edge cases
+### 3.4 Budget → compute: AdaLLaVA vs. vision token scheduler
+
+- **AdaLLaVA (LLM side):** The scalar `latency` ∈ [0,1] is **not** converted to FLOPs in the training loop. It is quantized (e.g. via `latency_quantizing`) to an integer that determines **how many LLM layers** (or sub-layers) to run (e.g. latency 1.0 → run all non-prefix layers). So the “budget” is a **compute ratio** mapped to discrete units (number of layers); there is no explicit FLOPs formula in the scheduler forward.
+- **Vision token scheduler (Exp1):** Similarly, `token_budget` ∈ [0,1] is mapped to **how many** vision tokens to keep: K = round(token_budget × N). Again, this is a ratio → discrete count (tokens), not a FLOPs value. FLOPs are used only **at evaluation** (e.g. accuracy–FLOPs curves) via an analytic formula that combines vision encoder, mm_projector, and LLM cost given K and sequence length.
+- **Alignment:** Both sides use the same *pattern*: a normalized budget (ratio) → quantized count of units (layers vs. tokens). Neither converts budget to FLOPs inside the forward pass. A single **unified** “whole-model FLOPs budget” would require a separate FLOPs model (e.g. FLOPs ≈ f(K_tokens, N_layers)), either at eval time (as in scripts that estimate FLOPs from budget) or in a joint controller; that is out of scope for the baseline Exp1 design.
+
+### 3.5 Edge cases
 
 - K=0: require at least 1 token (e.g. CLS only).
 - K≥N: no pruning; use all patches.
@@ -92,16 +95,9 @@ Implementation order: **Phase 1** uses Option B (minimal changes to the vision t
 
 ---
 
-## 4. Implementation Phases
+## 4. Implementation
 
-**Phase 1 (Option B):**  
-Use the existing vision encoder as-is. Add a budget encoder (sinusoidal + MLP) and a vision token controller that takes `(vision_output, budget_embedding)` and outputs per-patch logits, then Gumbel top-K. The scalar K (or r) is sampled each step and passed into the controller so it selects exactly K tokens; “how many” is always given from outside. Integrate this under a new `token_selecting="adaptive"` branch in `encode_images`, train with LM loss and random K, and run evaluation at a few K. Deliverable: one checkpoint and a small table of accuracy vs. K and vs. full tokens.
-
-**Phase 2 (Option A):**  
-Add a thin wrapper around the vision tower that appends the budget token to the encoder input, runs the ViT, and returns `[B, N+2, C_v]`. Reuse the same controller; optionally use the budget token’s output slice explicitly when computing logits. Retrain and re-evaluate; compare to Phase 1 to see if in-encoder fusion helps.
-
-**Phase 3:**  
-Stabilize FLOPs counting (vision + mm_projector + LLM), produce accuracy–FLOPs curves, and run the full comparison with LLaVA, PruMerge, and FastV on the chosen benchmarks. Document design choices (fixed vs variable K, CLS always kept, etc.) and ablations (with/without budget in encoder).
+The adaptive path uses: (1) `VisionEncoderWithBudgetToken` to append budget to patch sequence and run ViT → `[B, N+2, C_v]`; (2) `VisionTokenController` with only the budget token output → `Linear(C_v, N)` → Gumbel top-K. FLOPs counting (vision + mm_projector + LLM), accuracy–FLOPs curves, and comparison with LLaVA, PruMerge, and FastV are done at evaluation.
 
 ---
 
@@ -113,7 +109,7 @@ Stabilize FLOPs counting (vision + mm_projector + LLM), produce accuracy–FLOPs
 |------|--------|
 | `src/adallava/model/multimodal_encoder/budget_embedding.py` | Encode scalar budget → vector (sinusoidal + MLP). |
 | `src/adallava/model/multimodal_encoder/vision_token_controller.py` | Per-patch logits + Gumbel top-K; inputs vision features and token_budget. |
-| `src/adallava/model/multimodal_encoder/vision_with_budget_token.py` | (Phase 2) Wrapper that appends budget token, runs ViT, returns `[B, N+2, C_v]`. |
+| `src/adallava/model/multimodal_encoder/vision_with_budget_token.py` | Wrapper that appends budget token, runs ViT, returns `[B, N+2, C_v]`. |
 
 ### 5.2 Budget embedding (`budget_embedding.py`)
 
@@ -135,25 +131,15 @@ Stabilize FLOPs counting (vision + mm_projector + LLM), produce accuracy–FLOPs
 
 **Interface:**
 
-- `VisionTokenController(vision_dim: int, num_patches: int, tau: float = 5.0, use_cls: bool = True)`  
+- `VisionTokenController(vision_dim: int, num_patches: int, tau: float = 5.0)`  
   - `forward(vision_output: Tensor, token_budget: Tensor) -> Tuple[Tensor, Tensor]`  
-  - `vision_output`: Option A `[B, N+2, C]` (last position = budget token), Option B `[B, N+1, C]` (and budget passed separately; see below).  
+  - `vision_output`: `[B, N+2, C]` (last position = budget token output from ViT).  
   - `token_budget`: `[B]` with values in [0,1] (ratio) or integer K per batch; or a single scalar.  
-  - Returns: `(selected_features, mask)` where `selected_features` is `[B, 1+K, C]` (CLS + K patches) and `mask` is `[B, N]` or indices for downstream FLOPs/logging.
+  - Returns: `(selected_features, mask)` where `selected_features` is `[B, N, C]` (patch tokens only, unselected masked to 0) and `mask` is `[B, N]`.
 
-**Implementation sketch:**
+**Implementation:** Extract `budget_repr = vision_output[:, -1, :]` and `patch_tokens = vision_output[:, 1:-1, :]`. Logits: `logits = self.logit_head(budget_repr)` with `logit_head = nn.Linear(vision_dim, num_patches)`. Map `token_budget` to K per batch; select K via `n_times_gumbel_softmax`; apply mask to patch tokens. Straight-through in training.
 
-1. If Option B, accept an extra `budget_embedding: [B, C]` and optionally concatenate or condition logits on it.
-2. Extract patch (and optionally CLS) tokens from `vision_output`; if Option A, do not use the last position for “keep” logits, but optionally use it to condition the per-patch MLP.
-3. Per-patch logits: `logits = self.logit_head(patch_tokens)` → `[B, N]`, or `logits = self.logit_head(concat(patch_tokens, budget_repr))` if we condition on budget.
-4. Map `token_budget` to integer K per batch: e.g. `K = (token_budget * N).long().clamp(1, N)` for ratio, or use a discrete list.
-5. Use `masked_gumbel_softmax_topk(logits, masks=already_selected, k=K, ...)` in a loop, or implement “select K tokens” by K rounds of `masked_gumbel_softmax` as in `n_times_gumbel_softmax` but with top-k per step. Prefer reusing `scheduler_utils.masked_gumbel_softmax_topk` and a loop over k.
-6. Apply the resulting binary mask (or indices) to patch tokens, then prepend CLS → `[B, 1+K, C]`.
-7. Straight-through in training: use hard mask in forward, treat as if soft for gradients (or use the same trick as in `scheduler_utils`: `y_hard - y_soft.detach() + y_soft`).
-
-**References:** `src/adallava/model/scheduler/scheduler_utils.py` (`masked_gumbel_softmax`, `n_times_gumbel_softmax`, `masked_gumbel_softmax_topk`), `simple_scheduler.py` `forward` (L56–62) for the “n as number to select” pattern.
-
-### 5.4 Vision encoder with budget token (Phase 2, `vision_with_budget_token.py`)
+### 5.4 Vision encoder with budget token (`vision_with_budget_token.py`)
 
 **Interface:**
 
@@ -183,29 +169,19 @@ Stabilize FLOPs counting (vision + mm_projector + LLM), produce accuracy–FLOPs
 
 **Required change:**
 
-- Add branch `token_selecting == "adaptive"`:
-  1. Get `vision_tower = self.get_model().get_vision_tower()`.
-  2. **Phase 1 (Option B):**  
-     - Run vision: `vision_output = vision_tower(images, ...)` → `[B, N+1, C_v]` (use existing API; ensure we get hidden states or the same output as `feature_select` if that’s what we use elsewhere).  
-     - Sample token budget: `token_budget = self._get_token_budget(batch_size)` (e.g. random K or r).  
-     - Compute `budget_embedding = self.budget_embedding(token_budget)`.  
-     - `selected = self.vision_token_controller(vision_output, token_budget, budget_embedding=budget_embedding)` → `[B, 1+K, C_v]`.  
-  3. **Phase 2 (Option A):**  
-     - `vision_output = self.vision_with_budget_token(images, token_budget)` → `[B, N+2, C_v]`.  
-     - `selected = self.vision_token_controller(vision_output, token_budget)` (controller uses last position as budget token representation).  
-  4. In both: `image_features = self.get_model().mm_projector(selected)` and return `image_features`.
+- Add branch `token_selecting == "adaptive"`: get `vision_tower`; sample or use provided `token_budget`; `vision_output = self.vision_encoder_with_budget(images, token_budget, vision_tower)` → `[B, N+2, C_v]`; `selected, _ = self.vision_token_controller(vision_output, token_budget)`; `image_features = self.get_model().mm_projector(selected)`; return `image_features`.
 
 **New/updated config fields (e.g. in `AdaLlavaConfig` or model `__init__`):**
 
 - `token_selecting: str = "adaptive"` when using this path.  
 - `vision_controller_budget_min`, `vision_controller_budget_max`: for sampling r ∈ [min, max] and mapping to K.  
-- `vision_controller_tau: float = 5.0`, `vision_controller_use_cls: bool = True`.  
+- `vision_controller_tau: float = 5.0`.  
 - `num_vision_patches: int` (e.g. 576 for 336×336 ViT) for K range and Gumbel.
 
 **New attributes on `AdaLlavaLlamaForCausalLM` when `token_selecting == "adaptive"`:**
 - `self.budget_embedding = BudgetEmbedding(C_v, ...)`  
 - `self.vision_token_controller = VisionTokenController(C_v, num_patches=N, tau=...)`  
-- (Phase 2) `self.vision_with_budget_token = VisionEncoderWithBudgetToken(...)`  
+- `self.vision_encoder_with_budget = VisionEncoderWithBudgetToken(...)`  
 
 Initialization should only create these when `config.token_selecting == "adaptive"`, and `encode_images` should branch on the same flag.
 
@@ -235,7 +211,7 @@ Initialization should only create these when `config.token_selecting == "adaptiv
 |----------|--------|
 | `src/adallava/model/multimodal_encoder/budget_embedding.py` | New: `BudgetEmbedding` (sinusoidal + MLP). |
 | `src/adallava/model/multimodal_encoder/vision_token_controller.py` | New: `VisionTokenController` (logits + Gumbel top-K). |
-| `src/adallava/model/multimodal_encoder/vision_with_budget_token.py` | New (Phase 2): wrapper that appends budget, runs ViT. |
+| `src/adallava/model/multimodal_encoder/vision_with_budget_token.py` | Wrapper that appends budget, runs ViT. |
 | `src/adallava/model/ada_llava_llama.py` | In `encode_images`, add branch `"adaptive"`; in `__init__`, create `budget_embedding` and `vision_token_controller` when `token_selecting=="adaptive"`; add `_get_token_budget`. |
 | `AdaLlavaConfig` / model ctor | New args: `token_selecting="adaptive"`, `vision_controller_*`. |
 | `src/adallava/train/train.py` | New CLI args for adaptive path; pass them into config. |
@@ -246,7 +222,7 @@ Initialization should only create these when `config.token_selecting == "adaptiv
 
 ## 6. Design Rationale (concise)
 
-- **Budget token inside the encoder (Option A):** Puts “how much to keep” and “what is in the image” in one representation that the controller sees, analogous to AdaLLaVA’s latency token in the LLM.
+- **Budget token inside the encoder:** Puts “how much to keep” and “what is in the image” in one representation that the controller sees, analogous to AdaLLaVA’s latency token in the LLM.
 - **Two paths:** “Which” tokens to keep is driven by content and budget via the representation passed to the controller (Path 1); “how many” is set by the scalar token budget (Path 2), matching AdaLLaVA’s use of the latency scalar.
 - **Gumbel-Softmax top-K:** Keeps the same differentiable, discrete-selection recipe as AdaLLaVA; temperature and straight-through follow the existing scheduler.
 - **LM loss only:** Keeps the protocol aligned with AdaLLaVA; comparison with no-prune and other baselines is done at eval time with accuracy–FLOPs curves.

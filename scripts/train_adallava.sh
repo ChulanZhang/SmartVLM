@@ -4,11 +4,12 @@
 export WANDB_PROJECT=adallava
 # Uncomment one to choose where runs are logged:
 # export WANDB_ENTITY=pengchengwang92                    # personal account
-# export WANDB_ENTITY=pengchengwang92-purdue-university  # team (default if logged in via team)
-RUN_NUM=""
-
+export WANDB_ENTITY=pengchengwang92-purdue-university  # team (default if logged in via team)
 
 original_model="liuhaotian/llava-v1.5-7b"
+# Customize RUN_NAME based on your configuration (e.g., scheduler type, learning rate, etc.)
+RUN_NAME="ada-llava-L-v1.5-7b"
+OUTPUT_DIR="checkpoints/${RUN_NAME}"
 
 deepspeed ./src/adallava/train/train_mem.py \
     --deepspeed ./LLaVA/scripts/zero3.json \
@@ -28,7 +29,7 @@ deepspeed ./src/adallava/train/train_mem.py \
     --num_prefix_layers 16 \
     --token_selecting "none" \
     --scheduler_type "L" \
-    --output_dir checkpoints/ada-llava-L-v1.5-7b \
+    --output_dir "$OUTPUT_DIR" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 2 \
@@ -36,7 +37,7 @@ deepspeed ./src/adallava/train/train_mem.py \
     --save_strategy "steps" \
     --save_steps 500 \
     --save_total_limit 1 \
-    --learning_rate 1e-5 \
+    --learning_rate 2e-5 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
@@ -47,4 +48,4 @@ deepspeed ./src/adallava/train/train_mem.py \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name ada-llava-L-v1.5-7b${RUN_NUM} \
+    --run_name "$RUN_NAME" \

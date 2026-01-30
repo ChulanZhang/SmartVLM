@@ -1,0 +1,231 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+
+\title{Adaptive Vision Token Pruning for Efficient Multimodal Large Language Models}
+\author{Your Name}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present an adaptive vision token pruning method for vision-language models that dynamically selects a subset of vision tokens based on a token budget while maintaining fixed output dimensions. Our approach mirrors AdaLLaVA's two-path design: content and budget jointly determine \textit{which} tokens to keep (Path 1), while a scalar budget directly sets \textit{how many} tokens to select (Path 2). The method uses a trainable vision token controller with Gumbel-Softmax top-K selection, enabling end-to-end training with only language modeling loss. We evaluate on standard benchmarks and compare against static token reduction baselines (PruMerge, FastV) and full LLaVA, demonstrating improved efficiency-accuracy trade-offs.
+\end{abstract}
+
+\section{Introduction}
+
+Multimodal large language models (MLLMs) like LLaVA~\cite{llava} process images by converting them into a sequence of vision tokens (e.g., patch embeddings from a Vision Transformer). The number of vision tokens directly impacts computational cost: more tokens lead to longer sequences in the language model, increasing FLOPs quadratically with sequence length. However, not all vision tokens are equally important; many patches contain redundant or low-information content.
+
+We propose \textbf{adaptive vision token pruning} (Exp1), which dynamically selects a subset of vision tokens conditioned on a token budget. Unlike static methods that use fixed reduction ratios, our approach adapts the selection to both the image content and the available computational budget, enabling fine-grained control over the efficiency-accuracy trade-off.
+
+\section{Related Work}
+
+\subsection{AdaLLaVA: Adaptive Layer Pruning}
+
+AdaLLaVA~\cite{adallava} introduces adaptive depth pruning for the language model component, where a scheduler decides which transformer layers to execute based on a latency budget. The scheduler uses a two-path design:
+
+\begin{itemize}
+    \item \textbf{Path 1 (Content + Budget):} A latency token is inserted into the LLM input sequence and passes through prefix layers. The hidden state at the latency token position after prefix layers is a fusion of budget information (from the initial latency embedding) and content (from attention with image/text tokens). This fused representation is used to compute layer-selection logits.
+    \item \textbf{Path 2 (Budget Direct):} The scalar latency value is quantized to an integer $n$ (number of layers), and exactly $n$ layers are selected via Gumbel-Softmax top-$n$.
+\end{itemize}
+
+\subsection{Static Vision Token Reduction}
+
+Prior work includes PruMerge~\cite{prumerge} and FastV~\cite{fastv}, which use attention-based heuristics to merge or prune vision tokens before the language model. These methods are training-free but use fixed reduction ratios and do not adapt to content or budget.
+
+\section{Method}
+
+\subsection{Design Overview}
+
+We mirror AdaLLaVA's two-path design on the vision side:
+
+\begin{enumerate}
+    \item \textbf{Budget embedding and fusion:} A scalar token budget $b \in [0,1]$ (ratio) or integer $K$ is encoded into a vector representation that fuses with vision patch features.
+    \item \textbf{Token-level controller:} A trainable module computes per-patch keep logits conditioned on the fused representation and selects exactly $K$ patches via Gumbel-Softmax top-$K$.
+    \item \textbf{Fixed-length output:} The selected tokens maintain a fixed shape $[B, N, C]$ (or $[B, N+1, C]$ if CLS is included) by masking unselected patches to zero, ensuring compatibility with LLaVA's multimodal pipeline.
+\end{enumerate}
+
+\subsection{Two-Path Design}
+
+\subsubsection{Path 1: Content and Budget Jointly Determine ``Which''}
+
+The vision token controller receives:
+\begin{itemize}
+    \item Vision encoder output: $[B, N, C_v]$ (patch tokens) or $[B, N+1, C_v]$ (CLS + patches)
+    \item Budget embedding: $[B, C_v]$ computed from the scalar token budget
+\end{itemize}
+
+The controller concatenates each patch token with the budget embedding:
+\begin{equation}
+    \mathbf{p}_i' = [\mathbf{p}_i; \mathbf{b}] \in \mathbb{R}^{2C_v}
+\end{equation}
+where $\mathbf{p}_i$ is the $i$-th patch token and $\mathbf{b}$ is the budget embedding broadcast to all patches.
+
+Per-patch logits are computed via a linear head:
+\begin{equation}
+    \ell_i = \text{Linear}(\mathbf{p}_i') \in \mathbb{R}
+\end{equation}
+
+These logits reflect both patch content (from the vision encoder) and budget information (from the embedding), determining \textit{which} patches are more important to keep.
+
+\subsubsection{Path 2: Budget Directly Sets ``How Many''}
+
+The scalar token budget $b$ (or integer $K$) is mapped to an integer count:
+\begin{equation}
+    K = \lfloor b \cdot N \rfloor \in \{1, 2, \ldots, N\}
+\end{equation}
+
+The controller then selects exactly $K$ patches using Gumbel-Softmax top-$K$:
+\begin{equation}
+    \mathbf{m} = \text{GumbelTopK}(\boldsymbol{\ell}, K, \tau)
+\end{equation}
+where $\boldsymbol{\ell} = [\ell_1, \ldots, \ell_N]$ and $\mathbf{m} \in \{0,1\}^N$ is a binary mask with exactly $K$ ones.
+
+\subsection{Budget Embedding}
+
+The budget embedding module encodes a scalar budget $b \in [0,1]$ into a vector $\mathbf{b} \in \mathbb{R}^{C_v}$ using sinusoidal encoding followed by an MLP, following AdaLLaVA's latency encoding pattern:
+
+\begin{algorithmic}
+\STATE Scale: $s = b \cdot 2\pi$
+\STATE Frequencies: $f_k = 1 / (10000^{k/128})$ for $k \in \{0, \ldots, 127\}$
+\STATE Sinusoidal: $\mathbf{e} = [\sin(s \cdot f_0), \cos(s \cdot f_0), \ldots, \sin(s \cdot f_{127}), \cos(s \cdot f_{127})] \in \mathbb{R}^{256}$
+\STATE Project: $\mathbf{b} = \text{MLP}(\mathbf{e}) \in \mathbb{R}^{C_v}$
+\end{algorithmic}
+
+The MLP consists of LayerNorm, Linear($256 \to 256$), GELU, and Linear($256 \to C_v$).
+
+\subsection{Vision Token Controller}
+
+The controller takes vision output and token budget, and outputs selected features with fixed dimensions:
+
+\begin{algorithmic}
+\REQUIRE Vision output $\mathbf{V} \in \mathbb{R}^{B \times N \times C_v}$, token budget $b \in [0,1]$ or $K \in \mathbb{Z}^+$, budget embedding $\mathbf{b} \in \mathbb{R}^{B \times C_v}$
+\ENSURE Selected features $\mathbf{V}_{\text{sel}} \in \mathbb{R}^{B \times N \times C_v}$ (masked), keep mask $\mathbf{m} \in \{0,1\}^{B \times N}$
+\STATE Compute $K = \lfloor b \cdot N \rfloor$ per batch
+\STATE For each patch $i$: $\mathbf{p}_i' = [\mathbf{p}_i; \mathbf{b}]$
+\STATE Logits: $\ell_i = \text{Linear}(\mathbf{p}_i')$ for $i \in \{1, \ldots, N\}$
+\STATE Select $K$ patches: $\mathbf{m} = \text{GumbelTopK}(\boldsymbol{\ell}, K, \tau=5.0)$
+\STATE Mask: $\mathbf{V}_{\text{sel}} = \mathbf{V} \odot \mathbf{m}$ (broadcast)
+\RETURN $(\mathbf{V}_{\text{sel}}, \mathbf{m})$
+\end{algorithmic}
+
+The Gumbel-Softmax uses temperature $\tau=5.0$ and hard selection (straight-through estimator) during training. The output maintains shape $[B, N, C_v]$ with unselected patches set to zero, ensuring compatibility with LLaVA's mm\_projector and downstream components.
+
+\subsection{Training}
+
+Training uses only language modeling loss (no FLOPs regularization):
+
+\begin{itemize}
+    \item \textbf{Token budget sampling:} Each batch samples a random token budget $b \sim \text{Uniform}[b_{\min}, b_{\max}]$ (e.g., $[0.2, 1.0]$), mapped to $K = \lfloor b \cdot N \rfloor$.
+    \item \textbf{Forward pass:} Vision encoder $\to$ budget embedding $\to$ controller (selects $K$ patches) $\to$ mm\_projector $\to$ LLM.
+    \item \textbf{Loss:} Standard causal language modeling loss on the LLM output.
+    \item \textbf{Comparison:} Evaluation at multiple fixed $K$ values produces accuracy-FLOPs curves, compared against full LLaVA and static baselines.
+\end{itemize}
+
+\subsection{Implementation Details}
+
+\subsubsection{Vision Encoder Integration}
+
+We use LLaVA's CLIPVisionTower wrapper, which returns a plain Tensor (not a ModelOutput object) to ensure DeepSpeed ZeRO-3 compatibility. The vision encoder output shape depends on configuration:
+
+\begin{itemize}
+    \item \texttt{mm\_vision\_select\_feature='patch'} (default): Returns $[B, N, C_v]$ (no CLS token)
+    \item \texttt{mm\_vision\_select\_feature='cls\_patch'}: Returns $[B, N+1, C_v]$ (CLS + patches)
+\end{itemize}
+
+The controller's \texttt{use\_cls} flag is automatically set based on this configuration to maintain consistency.
+
+\subsubsection{ZeRO-3 Compatibility}
+
+To avoid DeepSpeed ZeRO-3 ``still have inflight params'' errors, we:
+\begin{itemize}
+    \item Call \texttt{vision\_tower(images)} which returns a Tensor, not the inner \texttt{CLIPVisionModel} which returns a ModelOutput object
+    \item Keep fixed output dimensions $[B, N, C_v]$ (masking to zero, not changing sequence length)
+    \item Maintain fixed module execution order (no dynamic layer skipping in the vision path)
+\end{itemize}
+
+\subsubsection{Per-Sample vs Per-Batch Budget}
+
+During training, we sample per-sample token budgets (like AdaLLaVA's per-sample latency), allowing the controller to learn across a range of budgets. The controller supports different $K$ values per sample via a per-batch loop, but maintains fixed execution order for ZeRO-3 stability.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+\begin{itemize}
+    \item \textbf{Model:} LLaVA-1.5-7B base, with adaptive vision token controller
+    \item \textbf{Dataset:} LLaVA v1.5 mix (665K samples)
+    \item \textbf{Training:} 1 epoch, batch size 16 per GPU, gradient accumulation 2, learning rate $10^{-5}$, cosine schedule
+    \item \textbf{Budget range:} $[0.2, 1.0]$ (20\% to 100\% of patches)
+    \item \textbf{Evaluation:} Multiple fixed token budgets: $K \in \{115, 230, 345, 460, 576\}$ (20\%, 40\%, 60\%, 80\%, 100\% of 576 patches)
+\end{itemize}
+
+\subsection{Baselines}
+
+\begin{itemize}
+    \item \textbf{Full LLaVA:} All 576 patches (baseline accuracy)
+    \item \textbf{PruMerge:} Static attention-based token merging
+    \item \textbf{FastV:} Static token pruning
+\end{itemize}
+
+\subsection{Metrics}
+
+For each token budget $K$, we report:
+\begin{itemize}
+    \item \textbf{Accuracy:} VQA accuracy on evaluation benchmarks
+    \item \textbf{FLOPs:} Computed as vision encoder (fixed) + mm\_projector($K$ tokens) + LLM(sequence length), where sequence length = $K$ + text length
+\end{itemize}
+
+\section{Results}
+
+[Results section to be filled after evaluation runs]
+
+\section{Discussion}
+
+\subsection{Design Choices}
+
+\begin{itemize}
+    \item \textbf{Fixed-length output:} Masking unselected patches to zero (rather than variable-length sequences) ensures compatibility with LLaVA's pipeline and avoids dynamic shape issues with DeepSpeed.
+    \item \textbf{LM loss only:} Following AdaLLaVA, we use only language modeling loss; comparison with baselines is done at evaluation time via accuracy-FLOPs curves.
+\end{itemize}
+
+\subsection{Limitations and Future Work}
+
+\begin{itemize}
+    \item \textbf{FLOPs counting:} Current implementation focuses on sequence-length-driven FLOPs; more detailed hardware-aware FLOPs measurement can be added.
+    \item \textbf{Per-sample budgets:} While supported, per-sample budgets may cause slight execution path variations; per-batch budgets can be used for stricter ZeRO-3 compatibility.
+\end{itemize}
+
+\section{Conclusion}
+
+We present an adaptive vision token pruning method that dynamically selects vision tokens based on content and budget, mirroring AdaLLaVA's two-path design. The method maintains fixed output dimensions for compatibility and enables fine-grained efficiency-accuracy trade-offs. Evaluation and comparison with static baselines will demonstrate the benefits of adaptive selection.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{llava}
+Liu, H., et al. (2023). Visual Instruction Tuning. \textit{NeurIPS}.
+
+\bibitem{adallava}
+[AdaLLaVA citation - to be added]
+
+\bibitem{prumerge}
+[PruMerge citation - to be added]
+
+\bibitem{fastv}
+[FastV citation - to be added]
+
+\end{thebibliography}
+
+\end{document}

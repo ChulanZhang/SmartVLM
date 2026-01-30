@@ -46,6 +46,7 @@ class AdaLlavaConfig(AdaLlamaConfig):
         vision_controller_tau=5.0,
         num_vision_patches=576,
         mm_hidden_size=None,  # vision encoder hidden size (e.g. 1024 for ViT-L); set from tower if None
+        freeze_llm_scheduler=False,  # when True and token_selecting='adaptive': full LLM (no layer/head skip)
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -57,6 +58,7 @@ class AdaLlavaConfig(AdaLlamaConfig):
         self.vision_controller_tau = vision_controller_tau
         self.num_vision_patches = num_vision_patches
         self.mm_hidden_size = mm_hidden_size
+        self.freeze_llm_scheduler = freeze_llm_scheduler
 
 
 class AdaLlavaLlamaModel(LlavaMetaModel, AdaLlamaModel):
@@ -87,14 +89,11 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         if getattr(config, "token_selecting", "none") == "adaptive":
             from .multimodal_encoder.budget_embedding import BudgetEmbedding
             from .multimodal_encoder.vision_token_controller import VisionTokenController
+            from .multimodal_encoder.vision_with_budget_token import VisionEncoderWithBudgetToken
 
             vision_dim = getattr(config, "mm_hidden_size", 1024)
             num_patches = getattr(config, "num_vision_patches", 576)
             tau = getattr(config, "vision_controller_tau", 5.0)
-            # When mm_vision_select_feature == "cls_patch", vision_tower returns [B, N+1, C];
-            # use_cls=True so controller keeps CLS and selects among N patches -> output [B, N+1, C].
-            # When "patch" (default), vision_tower returns [B, N, C]; use_cls=False -> output [B, N, C].
-            use_cls = getattr(config, "mm_vision_select_feature", "patch") == "cls_patch"
             self.budget_embedding = BudgetEmbedding(
                 dim_out=vision_dim, num_freqs=128, hidden_dim=256
             )
@@ -102,11 +101,15 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
                 vision_dim=vision_dim,
                 num_patches=num_patches,
                 tau=tau,
-                use_cls=use_cls,
+            )
+            self.vision_encoder_with_budget = VisionEncoderWithBudgetToken(
+                budget_embedding_module=self.budget_embedding,
+                vision_hidden_size=vision_dim,
             )
         else:
             self.budget_embedding = None
             self.vision_token_controller = None
+            self.vision_encoder_with_budget = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -126,6 +129,10 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         return torch.rand(batch_size, device=device, dtype=self.dtype) * (max_r - min_r) + min_r
 
     def encode_images(self, images, token_budget: Optional[torch.Tensor] = None, **kwargs):
+        """Vision token scheduler (token_selecting='adaptive') only affects this path.
+        Output is always image_features [B, N, C] fed to mm_projector; downstream LLM
+        (prepare_inputs_labels_for_multimodal -> insert_latency_token -> Ada Llama forward)
+        is unchanged and receives the same interface."""
         if type(images) is list or self.config.token_selecting == "none":
             return super().encode_images(images)
         elif self.config.token_selecting == "prumerge":
@@ -137,17 +144,7 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         elif self.config.token_selecting == "adaptive":
             vision_tower = self.get_model().get_vision_tower()
             images_in = images.to(device=self.device, dtype=self.dtype)
-            # IMPORTANT for ZeRO-3 stability:
-            # Do NOT call the inner transformers CLIPVisionModel directly here because it returns a
-            # ModelOutput object. DeepSpeed ZeRO-3 parameter offload hooks sometimes cannot detect
-            # tensors embedded in custom output objects, leading to "Invalidate trace cache" /
-            # "still have inflight params".
-            #
-            # Instead, call LLaVA's CLIPVisionTower wrapper, which returns a plain Tensor.
-            # Shape: [B, N, C] if mm_vision_select_feature=='patch', [B, N+1, C] if 'cls_patch'.
-            vision_output = vision_tower(images_in).to(self.dtype)
-
-            batch_size = vision_output.size(0)
+            batch_size = images_in.size(0)
             if token_budget is None:
                 if self.training:
                     token_budget = self._get_token_budget(batch_size)
@@ -164,10 +161,11 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
                         token_budget = torch.full(
                             (batch_size,), 1.0, device=self.device, dtype=self.dtype
                         )
-            budget_emb = self.budget_embedding(token_budget)
-            selected, _ = self.vision_token_controller(
-                vision_output, token_budget, budget_embedding=budget_emb
-            )
+            # Budget token appended to patch sequence -> ViT -> [B, N+2, C]; controller uses last pos -> Linear(C, N) -> logits.
+            vision_output = self.vision_encoder_with_budget(
+                images_in, token_budget, vision_tower=vision_tower
+            ).to(self.dtype)
+            selected, _ = self.vision_token_controller(vision_output, token_budget)
             image_features = self.get_model().mm_projector(selected)
             return image_features
         else:
@@ -213,13 +211,21 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
             )
 
         if self.training:
-            latency = self.scheduler.get_random_latency(inputs_embeds.size(0))
-            latency_embeding = self.scheduler.latency_encoding(latency.to(self.device, dtype=self.dtype))
-            inputs_embeds, position_ids, attention_mask, labels, latency_token_position = self.insert_latency_token(inputs_embeds=inputs_embeds, 
-                                                                                                position_ids_=position_ids,
-                                                                                                attention_mask_=attention_mask, 
-                                                                                                labels_=labels, 
-                                                                                                latency_embeding=latency_embeding)
+            # When training only the vision token scheduler (freeze_llm_scheduler + adaptive),
+            # run full LLM: no latency token, no scheduler; execution_plan = full (no skip).
+            if getattr(self.config, "freeze_llm_scheduler", False) and self.config.token_selecting == "adaptive":
+                latency = None
+                latency_token_position = None
+            else:
+                latency = self.scheduler.get_random_latency(inputs_embeds.size(0))
+                latency_embeding = self.scheduler.latency_encoding(latency.to(self.device, dtype=self.dtype))
+                inputs_embeds, position_ids, attention_mask, labels, latency_token_position = self.insert_latency_token(
+                    inputs_embeds=inputs_embeds,
+                    position_ids_=position_ids,
+                    attention_mask_=attention_mask,
+                    labels_=labels,
+                    latency_embeding=latency_embeding,
+                )
 
         outputs = super().forward(
             input_ids=input_ids,
