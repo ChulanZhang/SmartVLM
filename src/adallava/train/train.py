@@ -901,6 +901,9 @@ def train(attn_implementation=None):
 
     model.config.use_cache = False
 
+    # freeze_backbone=True freezes the entire model.model (LLaVA backbone): LLM, vision_tower, mm_projector.
+    # It does NOT freeze: lm_head, scheduler, budget_embedding, vision_token_controller, vision_encoder_with_budget
+    # (those are top-level on AdaLlavaLlamaForCausalLM, not inside model.model).
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 

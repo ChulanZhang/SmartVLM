@@ -23,7 +23,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.generation.utils import GenerateOutput
 
 from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from llava.constants import IGNORE_INDEX
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
 from .language_model.ada_llama.configuration_ada_llama import AdaLlamaConfig
 from .language_model.ada_llama.modeling_ada_llama import AdaLlamaModel, AdaLlamaForCausalLM, CausalLMOutputWithPast
@@ -70,6 +70,10 @@ class AdaLlavaLlamaModel(LlavaMetaModel, AdaLlamaModel):
 
 class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = AdaLlavaConfig
+    # Checkpoint keys under this prefix are not applied during from_pretrained (vision_tower is
+    # lazy-loaded later). They are loaded in builder.load_pretrained_model via
+    # _load_vision_tower_from_checkpoint to avoid "Some weights were not used" warning.
+    _keys_to_ignore_on_load_unexpected = [r"model\.vision_tower\..*"]
 
     def __init__(self, config):
         super(AdaLlamaForCausalLM, self).__init__(config)
@@ -130,9 +134,13 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
 
     def encode_images(self, images, token_budget: Optional[torch.Tensor] = None, **kwargs):
         """Vision token scheduler (token_selecting='adaptive') only affects this path.
-        Output is always image_features [B, N, C] fed to mm_projector; downstream LLM
-        (prepare_inputs_labels_for_multimodal -> insert_latency_token -> Ada Llama forward)
-        is unchanged and receives the same interface."""
+
+        - Training: output [B, N, C] with unselected positions zeroed; mm_projector and LLM
+          see N positions (no sequence-length change; backward / straight-through work).
+        - Evaluation: output [B, K, C] with only K selected tokens gathered; mm_projector and
+          LLM see K positions so FLOPs truly decrease. LLaVA merge uses image_features.size(1)
+          for the number of image token positions, so no change to prepare_inputs_labels_for_multimodal.
+        """
         if type(images) is list or self.config.token_selecting == "none":
             return super().encode_images(images)
         elif self.config.token_selecting == "prumerge":
@@ -165,8 +173,45 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
             vision_output = self.vision_encoder_with_budget(
                 images_in, token_budget, vision_tower=vision_tower
             ).to(self.dtype)
-            selected, _ = self.vision_token_controller(vision_output, token_budget)
-            image_features = self.get_model().mm_projector(selected)
+            selected, keep_mask = self.vision_token_controller(vision_output, token_budget)
+            if not self.training:
+                # Eval: gather only K kept tokens -> [B, K, C] so mm_projector and LLM see real sequence length K.
+                # FLOPs then truly decrease (mm_projector and LLM over K, not N).
+                patch_tokens = vision_output[:, 1:-1, :]  # [B, N, C]
+                B, N, C = patch_tokens.shape
+                k_per_batch = keep_mask.sum(dim=1)  # [B]
+                max_k = k_per_batch.max().item()
+                min_k = k_per_batch.min().item()
+                if max_k == min_k:
+                    # Same K for all (typical for fixed token_budget in eval sweep).
+                    K = int(min_k)
+                    idx_1d = keep_mask[0].nonzero(as_tuple=True)[0].long().to(device=patch_tokens.device)
+                    indices = idx_1d.unsqueeze(0).expand(B, -1).unsqueeze(-1).expand(B, K, C)
+                    gathered = torch.gather(patch_tokens, 1, indices)
+                else:
+                    # Different K per sample: gather per batch and pad to max_k (rare in eval).
+                    gathered_list = []
+                    for b in range(B):
+                        idx = keep_mask[b].nonzero(as_tuple=True)[0]
+                        g = patch_tokens[b : b + 1, idx, :]
+                        if g.size(1) < max_k:
+                            g = torch.nn.functional.pad(g, (0, 0, 0, max_k - g.size(1)), value=0.0)
+                        gathered_list.append(g)
+                    gathered = torch.cat(gathered_list, dim=0)
+                image_features = self.get_model().mm_projector(gathered)
+                # Expose K for eval logging (e.g. lmms_eval wrapper can log "vision_tokens_K" and FLOPs sanity-check).
+                K_used = image_features.shape[1]
+                object.__setattr__(self, "_last_vision_token_count", K_used)
+                # Debug: log once per process (Exp1 empty-resp debugging)
+                if not getattr(self, "_encode_images_eval_logged", False):
+                    import logging
+                    logging.getLogger(__name__).info(
+                        f"[Exp1 encode_images] eval path: image_features.shape={image_features.shape} device={image_features.device}"
+                    )
+                    object.__setattr__(self, "_encode_images_eval_logged", True)
+            else:
+                # Training: keep [B, N, C] with zeros so backward and straight-through work; no sequence-length change.
+                image_features = self.get_model().mm_projector(selected)
             return image_features
         else:
             raise NotImplementedError
@@ -275,15 +320,14 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
                            inputs_embeds[batch_idx][inserting_position[batch_idx]:]], 0)
                 )
             
-            new_attention_mask.append(
-                torch.cat([attention_mask[batch_idx][:inserting_position[batch_idx]], 
+            new_attn_b = torch.cat([attention_mask[batch_idx][:inserting_position[batch_idx]], 
                            torch.ones((1,), dtype=attention_mask.dtype, device=attention_mask.device), 
                            attention_mask[batch_idx][inserting_position[batch_idx]:]], 0)
-                )
+            new_attention_mask.append(new_attn_b)
 
-            cur_position_ids = torch.arange(new_attention_mask[-1].size(-1))
-            cur_position_ids[~new_attention_mask[-1]] = 0
-            new_position_ids.append(cur_position_ids.to(position_ids.device, dtype=position_ids.dtype))
+            cur_position_ids = torch.arange(new_attn_b.size(-1), device=position_ids.device, dtype=position_ids.dtype)
+            cur_position_ids[~new_attn_b] = 0
+            new_position_ids.append(cur_position_ids)
             
             new_labels.append(
                 torch.cat([labels[batch_idx][:inserting_position[batch_idx]], 
@@ -309,6 +353,128 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         
         return new_inputs_embeds, new_position_ids, new_attention_mask, new_labels, inserting_position
 
+    def prepare_inputs_labels_for_multimodal(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[List[torch.FloatTensor]],
+        labels: Optional[torch.LongTensor],
+        images: Optional[torch.FloatTensor],
+        image_sizes: Optional[List[List[int]]] = None,
+    ) -> Tuple[
+        torch.LongTensor,
+        Optional[torch.LongTensor],
+        Optional[torch.Tensor],
+        Optional[List[torch.FloatTensor]],
+        torch.FloatTensor,
+        Optional[torch.LongTensor],
+    ]:
+        """Override to support K image tokens in eval when token_selecting=='adaptive' (K < N).
+
+        LLaVA's merge expects image_features.size(1) to match the number of IMAGE_TOKEN_INDEX
+        in input_ids. When we use a token budget, encode_images returns [B, K, C] but the
+        tokenized prompt has N placeholders. We shorten the sequence by keeping only K
+        image placeholder positions so the parent merge gets K positions and K features.
+        """
+        if (
+            getattr(self.config, "token_selecting", "none") != "adaptive"
+            or self.training
+            or images is None
+        ):
+            return super().prepare_inputs_labels_for_multimodal(
+                input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes=image_sizes
+            )
+
+        # Eval with adaptive: get K from encode_images, N from input_ids placeholder count.
+        with torch.no_grad():
+            image_features = self.encode_images(images, image_sizes=image_sizes)
+        K = image_features.shape[1]
+        # Number of image placeholder positions (assume one contiguous block per batch).
+        is_img = input_ids == IMAGE_TOKEN_INDEX
+        # Use first batch to get N; in VQA typically same N for all.
+        first_row = is_img[0]
+        if not first_row.any():
+            return super().prepare_inputs_labels_for_multimodal(
+                input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes=image_sizes
+            )
+        img_indices = first_row.nonzero(as_tuple=True)[0]
+        N = img_indices.numel()
+        # Expose N for debug (wrapper can log N vs K; FLOPs use inputs_embeds.shape[1] in generate()).
+        object.__setattr__(self, "_last_vision_placeholder_N", N)
+        if K >= N:
+            # Still force first return to be input_ids so generate() gets full sequence (parent may return None).
+            out = super().prepare_inputs_labels_for_multimodal(
+                input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes=image_sizes
+            )
+            return (input_ids, out[1], out[2], out[3], out[4], out[5])
+
+        # K < N: shorten sequence by removing (N - K) image placeholder positions per batch.
+        B, L = input_ids.shape
+        new_len = L - (N - K)
+        new_input_ids = input_ids.new_zeros(B, new_len)
+        new_position_ids = (
+            position_ids.new_zeros(B, new_len).to(dtype=position_ids.dtype, device=position_ids.device)
+            if position_ids is not None
+            else None
+        )
+        new_attention_mask = (
+            attention_mask.new_zeros(B, new_len, dtype=attention_mask.dtype, device=attention_mask.device)
+            if attention_mask is not None
+            else None
+        )
+        new_labels = (
+            labels.new_full((B, new_len), IGNORE_INDEX, device=labels.device)
+            if labels is not None
+            else None
+        )
+
+        for b in range(B):
+            row = is_img[b]
+            if not row.any():
+                new_input_ids[b] = input_ids[b, :new_len]
+                if new_position_ids is not None and position_ids is not None:
+                    new_position_ids[b] = position_ids[b, :new_len]
+                if new_attention_mask is not None:
+                    new_attention_mask[b] = attention_mask[b, :new_len]
+                if new_labels is not None:
+                    new_labels[b] = labels[b, :new_len]
+                continue
+            idx = row.nonzero(as_tuple=True)[0]
+            start = idx[0].item()
+            end = idx[-1].item() + 1
+            # Keep: [ :start ], [ start : start+K ], [ end : ]
+            new_input_ids[b] = torch.cat([
+                input_ids[b, :start],
+                input_ids[b, start : start + K],
+                input_ids[b, end:],
+            ], dim=0)
+            if new_position_ids is not None and position_ids is not None:
+                new_position_ids[b] = torch.cat([
+                    position_ids[b, :start],
+                    position_ids[b, start : start + K],
+                    position_ids[b, end:],
+                ], dim=0)
+            if new_attention_mask is not None:
+                new_attention_mask[b] = torch.cat([
+                    attention_mask[b, :start],
+                    attention_mask[b, start : start + K],
+                    attention_mask[b, end:],
+                ], dim=0)
+            if new_labels is not None:
+                new_labels[b] = torch.cat([
+                    labels[b, :start],
+                    labels[b, start : start + K],
+                    labels[b, end:],
+                ], dim=0)
+
+        # Call parent merge; then force first return to be new_input_ids so generate() gets
+        # shortened input_ids (parent may return None for first value → outputs.sequences only generated part).
+        out = super().prepare_inputs_labels_for_multimodal(
+            new_input_ids, new_position_ids, new_attention_mask, past_key_values, new_labels, images, image_sizes=image_sizes
+        )
+        # Ensure caller gets new_input_ids for building full sequence in generate().
+        return (new_input_ids, out[1], out[2], out[3], out[4], out[5])
 
     @torch.no_grad()
     def generate(
@@ -348,33 +514,82 @@ class AdaLlavaLlamaForCausalLM(AdaLlamaForCausalLM, LlavaMetaForCausalLM):
         if isinstance(latency, float):
             latency = torch.full((inputs_embeds.shape[0],), latency, dtype=self.dtype)
 
-        latency_embeding = self.scheduler.latency_encoding(latency.to(self.device, dtype=self.dtype))
-        inputs_embeds, position_ids, attention_mask, _, latency_token_position = self.insert_latency_token(inputs_embeds=inputs_embeds, 
-                                                                                             position_ids_=position_ids,
-                                                                                             attention_mask_=attention_mask, 
-                                                                                             labels_=None, 
-                                                                                             latency_embeding=latency_embeding)
+        # When only the vision token scheduler is used (freeze_llm_scheduler + adaptive), keep behavior aligned with
+        # training: no latency token in sequence, and LLM runs all layers and heads (no layer/head scheduler).
+        # Training does the same in forward(): latency=None, latency_token_position=None → LLM sets
+        # execution_plan = [None] * num_hidden_layers (see modeling_ada_llama.py).
+        is_adaptive_only = (
+            getattr(self.config, "token_selecting", "none") == "adaptive"
+            and getattr(self.config, "freeze_llm_scheduler", False)
+        )
+        if is_adaptive_only:
+            latency_token_position = None
+            latency_for_llm = None  # LLM then uses execution_plan = [None]*n → all layers/heads active
+        else:
+            latency_embeding = self.scheduler.latency_encoding(latency.to(self.device, dtype=self.dtype))
+            inputs_embeds, position_ids, attention_mask, _, latency_token_position = self.insert_latency_token(
+                inputs_embeds=inputs_embeds,
+                position_ids_=position_ids,
+                attention_mask_=attention_mask,
+                labels_=None,
+                latency_embeding=latency_embeding,
+            )
+            latency_for_llm = latency
+
         assert inputs_embeds.shape[0] == 1, "Batch size > 1 is not supported."
 
+        # Align input_ids length with inputs_embeds when we inserted a latency token (no token id for that position).
+        if inputs is not None and inputs.shape[1] + 1 == inputs_embeds.shape[1] and latency_token_position is not None:
+            pos = int(latency_token_position[0].item())
+            last_id = inputs[0, pos - 1].item() if pos > 0 else None
+            if last_id is not None and 0 <= last_id < self.config.vocab_size:
+                pad_id = last_id
+            else:
+                pad_id = getattr(self.config, "pad_token_id", None)
+                if pad_id is None or pad_id == 0:
+                    pad_id = getattr(self.config, "bos_token_id", 1)
+                pad_id = max(0, min(int(pad_id), self.config.vocab_size - 1))
+            inputs = torch.cat([
+                inputs[:, :pos],
+                torch.full((inputs.size(0), 1), pad_id, device=inputs.device, dtype=inputs.dtype),
+                inputs[:, pos:],
+            ], dim=1)
+
         outputs = super().generate(
+            inputs,
             position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            latency=latency,
+            latency=latency_for_llm,
             latency_token_position=latency_token_position,
             return_dict_in_generate=return_dict_in_generate,
             **kwargs
         )
-        
+
         if return_dict_in_generate:
-            prompt_len = inputs_embeds.shape[1] + 1
-            gen_len = outputs.sequences.shape[1] - 1
-            execution_plan = DynamicCacheWithExecutionPlan.get_execution_plan_from_legacy_cache(outputs.past_key_values, self.config.num_hidden_layers)
-            execution_plan = [_.sum().item()//2 for _ in execution_plan]
+            # prompt_len (embed space): for FLOPs — actual sequence length the LLM sees (1+text+K).
+            # prompt_len_tokens (token space): length of prompt in outputs.sequences. Parent builds
+            # sequences from compact input_ids when available. When inputs is None (latency model path:
+            # parent returns None from prepare_inputs_labels_for_multimodal), the parent's generate()
+            # typically returns output.sequences containing only the generated tokens (no prompt ids),
+            # so prompt_len_tokens = 0.
+            prompt_len = int(inputs_embeds.shape[1])
+            prompt_len_tokens = (
+                int(inputs.shape[1]) if inputs is not None else 0
+            )
+            gen_len = outputs.sequences.shape[1] - prompt_len_tokens
+            raw_plan = DynamicCacheWithExecutionPlan.get_execution_plan_from_legacy_cache(outputs.past_key_values, self.config.num_hidden_layers)
+            num_heads = getattr(self.config, "num_attention_heads", 32)
+            # None = full layer (no skip); tensor = scheduler output. For outputs we use int per layer (heads count).
+            execution_plan = [
+                num_heads if _ is None else (_.sum().item() // 2)
+                for _ in raw_plan
+            ]
             execution_plan = [-1 if _ == 0 else _ for _ in execution_plan]
-            setattr(outputs, 'prompt_len', prompt_len)
-            setattr(outputs, 'gen_len', gen_len)
-            setattr(outputs, 'execution_plan', execution_plan)
+            setattr(outputs, "prompt_len", prompt_len)
+            setattr(outputs, "prompt_len_tokens", prompt_len_tokens)
+            setattr(outputs, "gen_len", gen_len)
+            setattr(outputs, "execution_plan", execution_plan)
             return outputs
         else:
             return outputs

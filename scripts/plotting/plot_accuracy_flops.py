@@ -76,8 +76,13 @@ def estimate_flops_from_budget(
     llm_per_token: float = 1e8,
     avg_text_len: int = 512,
 ) -> float:
-    """Rough FLOPs for one forward: vision (const) + mm_projector on (1+K) + LLM on (1+K)+text.
-    Coefficients are placeholders; replace with your own counts if available.
+    """Rough FLOPs for one forward assuming *effective* sequence length (1+K)+text.
+
+    This assumes we pass only K selected vision tokens to mm_projector and LLM.
+    **Current Exp1 implementation** passes [B, N, C] with masked positions zeroed,
+    so actual FLOPs are still over N positions (no reduction). This estimate is
+    thus an idealized upper-bound on savings; use it for accuracy-vs-FLOPs curves
+    when comparing designs. Coefficients are placeholders.
     """
     k = max(1, int(round(token_budget * num_patches)))
     mm_flops = (1 + k) * mm_proj_per_token

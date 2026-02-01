@@ -87,6 +87,14 @@ The controller takes **only** this budget token output (last position) and one l
 - **Vision token scheduler (Exp1):** Similarly, `token_budget` ∈ [0,1] is mapped to **how many** vision tokens to keep: K = round(token_budget × N). Again, this is a ratio → discrete count (tokens), not a FLOPs value. FLOPs are used only **at evaluation** (e.g. accuracy–FLOPs curves) via an analytic formula that combines vision encoder, mm_projector, and LLM cost given K and sequence length.
 - **Alignment:** Both sides use the same *pattern*: a normalized budget (ratio) → quantized count of units (layers vs. tokens). Neither converts budget to FLOPs inside the forward pass. A single **unified** “whole-model FLOPs budget” would require a separate FLOPs model (e.g. FLOPs ≈ f(K_tokens, N_layers)), either at eval time (as in scripts that estimate FLOPs from budget) or in a joint controller; that is out of scope for the baseline Exp1 design.
 
+### 3.6 FLOPs and masked tokens (current implementation)
+
+**Training vs evaluation (aligned with AdaLLaVA):**
+
+- **Training:** The controller outputs **fixed shape** `[B, N, C]` with **unselected positions zeroed** (masked to 0). This tensor is passed to `mm_projector` and then to the LLM. Sequence length remains N so that backward and straight-through work.
+- **Evaluation:** In `encode_images`, when **`not self.training`**, we **gather only the K selected tokens** into `[B, K, C]` and pass that to mm_projector. So mm_projector and the LLM see sequence length **K**; **FLOPs truly decrease**. LLaVA merge uses `image_features.size(1)` for the number of image token positions, so no change to `prepare_inputs_labels_for_multimodal` is required.
+- **Plot / estimate:** `scripts/plotting/plot_accuracy_flops.py` uses `estimate_flops_from_budget(token_budget)`, which assumes effective sequence length **(1+K)+text**. With the eval-time gather, this now matches the **actual** forward at evaluation.
+
 ### 3.5 Edge cases
 
 - K=0: require at least 1 token (e.g. CLS only).
@@ -199,13 +207,18 @@ Initialization should only create these when `config.token_selecting == "adaptiv
 - When building the model, ensure `AdaLlavaConfig` (or the constructor of `AdaLlavaLlamaForCausalLM`) gets `token_selecting="adaptive"` and the new vision-controller-related arguments so that `budget_embedding` and `vision_token_controller` are created.
 - No change to the loss: keep LM loss only. The dataloader does not need to provide `token_budget` if it is sampled inside the model at the start of each forward (as in AdaLLaVA’s latency).
 
-### 5.8 Evaluation and FLOPs
+### 5.8 Demo and inspecting intermediate variables
+
+- **Script:** `scripts/demo_vision_token_prune.py` runs one image through the vision token scheduler and prints intermediate variables (token_budget, N, K, keep_mask sum per sample, logits shape and stats, nonzero patch count). Use this to verify that tokens are pruned as expected (mask sum == K).
+- **Usage (from repo root):** `PYTHONPATH=src python scripts/demo_vision_token_prune.py --model-path <ckpt> --image-file docs/snowman.jpg --token_budget 0.5`. Add `--no-generate` to skip the generate step and only print vision-path vars.
+
+### 5.9 Evaluation and FLOPs
 
 - Add a CLI or config option for a list of token budgets, e.g. `--eval_budgets 64 128 256 384 576`.
 - For each budget K, set the model (or the batch) to use that K when calling `encode_images` / `generate`, run the eval set, and record accuracy.
-- FLOPs: use a small hook or an analytic formula. Main terms: (1) vision encoder forward (constant), (2) mm_projector on (1+K) tokens, (3) LLM on sequence length = (1+K) + text length. Implement a helper that, given K and text length, returns total FLOPs for the chosen formula, then attach it to the eval loop so each (accuracy, FLOPs) pair is logged. Plot accuracy vs. FLOPs and compare to full LLaVA, PruMerge, and FastV.
+- FLOPs: use a small hook or an analytic formula. Main terms: (1) vision encoder forward (constant), (2) mm_projector on (1+K) tokens *if* sequence is reduced to K; **current implementation** keeps N positions (masked to 0), so actual FLOPs are over N (see §3.6). The helper in `scripts/plotting/plot_accuracy_flops.py` (`estimate_flops_from_budget`) assumes effective length (1+K)+text for plotting accuracy–FLOPs curves. Plot accuracy vs. FLOPs and compare to full LLaVA, PruMerge, and FastV.
 
-### 5.9 Summary of code touchpoints
+### 5.10 Summary of code touchpoints
 
 | Location | Change |
 |----------|--------|
@@ -240,3 +253,20 @@ Initialization should only create these when `config.token_selecting == "adaptiv
 | Latency token insertion | `src/adallava/model/ada_llava_llama.py`: `insert_latency_token`, L136–141, L186–188 |
 | Scheduler call and hidden-state read | `src/adallava/model/language_model/ada_llama/modeling_ada_llama.py`: L337–340 (`latency_token = hidden_states[..., latency_token_position]`, `scheduler(latency_token, latency)`) |
 | Vision tower and feature selection | `src/adallava/model/multimodal_encoder/prumerge_utils.py`: `vision_tower(...)`, `feature_select(...)`; `vision_tower.vision_model.encoder.layers` for ViT structure |
+
+---
+
+## 8. Exp1 profiling and logging
+
+**Profiling (FLOPs) now runs correctly for Exp1:**
+
+- **ada_analyzer:** `analyze_generate_task` uses `prompt_len` as LLM input sequence length (for Exp1 = text + K vision tokens); no fixed N. `gen_len` is guarded with `max(0, gen_len)` and `avg_flops` avoids division by zero when `gen_len <= 0`.
+- **adallava_wrapper:** Single-GPU uses `device_map="auto"` so builder sets `cuda:0` (avoids tied-weights / vision tower on wrong device). After generate, `prompt_len` / `gen_len` / `vision_tokens_K` are taken from model outputs; generated text is decoded from the token-space slice using `prompt_len_tokens` and safe token IDs to avoid SentencePiece "piece id out of range". Results dict exposes `prompt_len`, `gen_len`, and `vision_tokens_K` for samples JSONL and sweep outputs.
+- **cache_utils:** `from_legacy_cache` supports both `(key, value, drop_states)` and `(key, value)`; `get_execution_plan` handles execution_plan as dict or list so legacy caches without execution_plan yield full run.
+
+**Detailed logging:**
+
+- Wrapper logs `[Exp1] prompt_len=... gen_len=... vision_tokens_K=... seq_len=... resp_len=... resp_preview=...` per sample. With `ADALLAVA_DEBUG` or `ADALLAVA_DEBUG_FLOPS`, logs also include N (image placeholder count), K, and prefill_flops for sanity-check.
+- `encode_images` (eval, adaptive) logs once per process: `[Exp1 encode_images] eval path: image_features.shape=... device=...`.
+
+**Related debug docs:** `docs/EXP1_EVAL_LOW_ACCURACY_DEBUG.md` (low accuracy / empty resps, K≠N merge fix), `docs/EVALUATION_LAYER_SKIP_AND_FLOPS.md` (layer skip and FLOPs computation).

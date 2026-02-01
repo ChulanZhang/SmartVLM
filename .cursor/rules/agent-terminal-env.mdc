@@ -1,0 +1,15 @@
+---
+description: When the agent runs terminal commands for debugging or testing, activate the project environment first.
+alwaysApply: true
+---
+
+# Agent Terminal / Debug Environment
+
+When **running terminal commands** in this project (e.g. `python`, `pytest`, `bash scripts/...`) for **debugging or testing**, the agent should ensure the environment is activated:
+
+- **From repo root**, run: `source activate_env.sh` before executing project commands, **or**
+- Run the command in a shell that has **already** sourced `activate_env.sh` (e.g. user has activated manually).
+
+This loads the required modules (conda, cuda, cudnn, etc.) and the project conda env (e.g. smartvlm-py3.10). Without it, commands may fail with missing `llava`, `torch`, or CUDA.
+
+**Note:** Evaluation/training scripts in `scripts/` do **not** source `activate_env.sh` by default; the user activates the environment manually when running experiments. This rule is for **agent-initiated** runs (debug, quick tests, lint, etc.).

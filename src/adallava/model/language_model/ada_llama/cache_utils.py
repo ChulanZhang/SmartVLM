@@ -128,15 +128,24 @@ class DynamicCacheWithExecutionPlan(DynamicCache):
         cache = cls(n_layers)
         if past_key_values is not None:
             for layer_idx in range(len(past_key_values)):
-                key_states, value_states, drop_states = past_key_values[layer_idx]
+                layer_entry = past_key_values[layer_idx]
+                # Support both (key, value, drop_states) and (key, value) legacy formats.
+                if len(layer_entry) >= 3:
+                    key_states, value_states, drop_states = layer_entry[0], layer_entry[1], layer_entry[2]
+                else:
+                    key_states, value_states, drop_states = layer_entry[0], layer_entry[1], None
                 if key_states is not None:
                     cache.update(key_states, value_states, layer_idx)
                 cache.update_execution_plan(drop_states, layer_idx)
         return cache
     
     def get_execution_plan(self) -> List:
-        execution_plan = [self.execution_plan[layer_idx] for layer_idx in range(len(self))]
-        return execution_plan
+        # execution_plan can be a dict (from from_legacy_cache) or a list (assigned in model forward).
+        # Use .get for dict so missing keys (e.g. legacy cache without execution_plan) yield None → full run.
+        n = len(self)
+        if isinstance(self.execution_plan, dict):
+            return [self.execution_plan.get(layer_idx) for layer_idx in range(n)]
+        return [self.execution_plan[layer_idx] for layer_idx in range(n)]
     
     @classmethod
     def get_execution_plan_from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None, n_layers: int = 24) -> List:

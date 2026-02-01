@@ -4,6 +4,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 
 import copy
+import os
 import warnings
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
@@ -99,13 +100,16 @@ class AdaLlava(Llava):
         if "use_flash_attention_2" in kwargs:
             llava_model_args["use_flash_attention_2"] = kwargs["use_flash_attention_2"]
         model_name = model_name if model_name is not None else get_model_name_from_path(pretrained)
+        # Single-GPU: use "auto" so builder can set device_map to cuda:0 (same as demo), avoiding
+        # tied-weights bug and vision tower on another device (cuda:1).
+        _device_map = "auto" if (hasattr(accelerator, "num_processes") and accelerator.num_processes == 1) else self.device_map
         try:
             # Try to load the model with the multimodal argument
-            self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, device_map=self.device_map, **llava_model_args)
+            self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, device_map=_device_map, **llava_model_args)
         except TypeError:
             # for older versions of LLaVA that don't have multimodal argument
             llava_model_args.pop("multimodal", None)
-            self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, device_map=self.device_map, **llava_model_args)
+            self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, device_map=_device_map, **llava_model_args)
         self._config = self._model.config
         self.model.eval()
         if tie_weights:
@@ -271,11 +275,53 @@ class AdaLlava(Llava):
                     return_dict_in_generate=True,
                 )
                 cont = outputs.sequences
-                prompt_len, gen_len, num_heads = outputs.prompt_len, outputs.gen_len, outputs.execution_plan
-                text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+                prompt_len = getattr(outputs, "prompt_len", None)
+                prompt_len_tokens = getattr(outputs, "prompt_len_tokens", None)
+                gen_len = getattr(outputs, "gen_len", None)
+                num_heads = getattr(outputs, "execution_plan", None)
+                # Exp1: actual vision token count K after prune (for logging and FLOPs sanity-check).
+                vision_tokens_K = getattr(self.model, "_last_vision_token_count", None)
+                if vision_tokens_K is not None:
+                    try:
+                        vision_tokens_K = int(vision_tokens_K)
+                    except Exception:
+                        vision_tokens_K = None
+                # Decode only the generated part; sanitize token IDs to avoid SentencePiece "piece id is out of range"
+                vocab_size = len(self.tokenizer)
+                eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 2
+                pad_id = getattr(self.tokenizer, "pad_token_id", None)
+
+                def _safe_id(i: int) -> int:
+                    if not (0 <= i < vocab_size):
+                        return eos_id
+                    if i == 0 and pad_id is None:
+                        return eos_id
+                    return i
+
+                batch_size = cont.shape[0]
+                seq_len = cont.shape[1]
+                # Slice by token-space prompt length (outputs.sequences is [compact_prompt | generated]).
+                pl = int(prompt_len_tokens) if prompt_len_tokens is not None else (int(prompt_len) if prompt_len is not None else seq_len)
+                pl = min(pl, seq_len)
+                text_outputs = []
+                for b in range(batch_size):
+                    gen_ids = cont[b, pl:].tolist()
+                    safe_ids = [_safe_id(i) for i in gen_ids]
+                    text_outputs.append(self.tokenizer.decode(safe_ids, skip_special_tokens=True).strip())
+                # Debug: log gen length, vision token count K (prune), and first response (Exp1)
+                _seq_len = cont.shape[1] if cont.dim() > 1 else 0
+                _gen_len = int(gen_len) if gen_len is not None else max(0, _seq_len - pl)
+                _resp0 = text_outputs[0] if text_outputs else ""
+                eval_logger.info(
+                    f"[Exp1] prompt_len={prompt_len} gen_len={gen_len} vision_tokens_K={vision_tokens_K} "
+                    f"seq_len={_seq_len} resp_len={len(_resp0)} resp_preview={repr(_resp0[:120])}"
+                )
+                _gen_len_safe = max(0, int(gen_len)) if gen_len is not None else max(0, _seq_len - pl)
+                # FLOPs: use embed-space prompt_len (LLM input seq length). For Exp1 = text + K vision tokens.
+                _pl = int(prompt_len) if prompt_len is not None else _seq_len
                 results = self.analyzer.analyze_generate_task(
-                    prompt_len=prompt_len,
-                    gen_len=gen_len,
+                    prompt_len=_pl,
+                    gen_len=_gen_len_safe,
                     num_heads=num_heads,
                     batchsize=1,
                     w_bit=16,
@@ -283,6 +329,22 @@ class AdaLlava(Llava):
                     kv_bit=16,
                     use_flashattention=False,
                 )
+                # Expose pruned token count and lengths so test/sweep output and samples JSONL show them.
+                results["prompt_len"] = _pl
+                results["gen_len"] = _gen_len_safe
+                if vision_tokens_K is not None:
+                    results["vision_tokens_K"] = vision_tokens_K
+                # Optional debug: N (image placeholder count in input_ids), K (vision tokens after prune), prompt_len, prefill_flops
+                if os.environ.get("ADALLAVA_DEBUG_FLOPS") or os.environ.get("ADALLAVA_DEBUG"):
+                    vision_placeholder_N = getattr(self.model, "_last_vision_placeholder_N", None)
+                    eval_logger.info(
+                        f"[Exp1 FLOPs debug] N={vision_placeholder_N} K={vision_tokens_K} prompt_len={_pl} "
+                        f"prefill_flops={results.get('prefill_flops', 0):.0f}"
+                    )
+                else:
+                    eval_logger.info(
+                        f"[Exp1 FLOPs] prompt_len={_pl} vision_K={vision_tokens_K} prefill_flops={results.get('prefill_flops', 0):.0f}"
+                    )
 
             except Exception as e:
                 raise e

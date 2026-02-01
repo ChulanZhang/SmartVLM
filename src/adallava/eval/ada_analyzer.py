@@ -415,6 +415,8 @@ class AdaptiveAnalyzer(ModelAnalyzer):
         use_flashattention = False,
         tp_size: int = 1
     ):
+        # FLOPs are computed from prompt_len (LLM input sequence length). No fixed N is used.
+        # For Exp1 (vision token prune), the wrapper passes the shortened prompt_len = text + K vision tokens.
         prefill_result = self.analyze_all_layers(
             prompt_len,
             num_heads,
@@ -429,13 +431,14 @@ class AdaptiveAnalyzer(ModelAnalyzer):
         prefill_flops = flops = prefill_result["prefill"]["OPs"]
         prefill_memory_consumption = memory_consumption = prefill_result["prefill"]["memory_consumption"]
 
-        for i in range(prompt_len, prompt_len + gen_len - 1):
+        for i in range(prompt_len, prompt_len + max(0, gen_len) - 1):
             result = self.analyze_all_layers(i, num_heads, batchsize, w_bit, a_bit, kv_bit, use_flashattention=use_flashattention, tp_size=tp_size)
             inference_time += result["decode"]["inference_time"]
             flops += result["decode"]["OPs"]
             memory_consumption += result["decode"]["memory_consumption"]
-        avg_flops = flops / gen_len
-    
+        # Avoid ZeroDivisionError when gen_len <= 0 (e.g. outputs.sequences only had prompt/generated part)
+        avg_flops = (flops / gen_len) if gen_len > 0 else float(prefill_flops)
+
         return {"flops": flops,
                 "avg_flops": avg_flops,
                 "prefill_flops": prefill_flops,
