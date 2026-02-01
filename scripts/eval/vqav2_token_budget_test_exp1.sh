@@ -21,6 +21,9 @@ LIMIT="${LIMIT:-10}"
 NUM_PROCESSES=1
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29502}"
 BASE_OUTPUT="./results/logs_token_budget_test_vqav2_val_exp1"
+# Per-sample debug logs (Exp1/FLOPs): set DEBUG=1 to enable (default off)
+DEBUG="${DEBUG:-0}"
+export DEBUG
 
 echo "========== token_budget=${TOKEN_BUDGET} limit=${LIMIT} samples (single GPU) =========="
 HF_DATASETS_DISABLE_FILE_LOCKING=1 python3 -m accelerate.commands.launch \

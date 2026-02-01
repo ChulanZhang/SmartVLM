@@ -4,10 +4,22 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 
 import copy
+import logging
 import os
 import warnings
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
+
+# Per-sample messages (Exp1 / FLOPs) use logger.debug(). Enable via:
+#   logging.getLogger("adallava.eval.adallava_wrapper").setLevel(logging.DEBUG)
+#   or from scripts: DEBUG=1 bash scripts/eval/...
+logger = logging.getLogger(__name__)
+if os.environ.get("DEBUG", "").strip() in ("1", "true", "yes"):
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setLevel(logging.DEBUG)
+        logger.addHandler(_h)
 
 from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from accelerate.state import AcceleratorState
@@ -308,13 +320,13 @@ class AdaLlava(Llava):
                     gen_ids = cont[b, pl:].tolist()
                     safe_ids = [_safe_id(i) for i in gen_ids]
                     text_outputs.append(self.tokenizer.decode(safe_ids, skip_special_tokens=True).strip())
-                # Debug: log gen length, vision token count K (prune), and first response (Exp1)
+                # Per-sample debug: use logger.debug(); enable with setLevel(logging.DEBUG) on this logger
                 _seq_len = cont.shape[1] if cont.dim() > 1 else 0
                 _gen_len = int(gen_len) if gen_len is not None else max(0, _seq_len - pl)
                 _resp0 = text_outputs[0] if text_outputs else ""
-                eval_logger.info(
-                    f"[Exp1] prompt_len={prompt_len} gen_len={gen_len} vision_tokens_K={vision_tokens_K} "
-                    f"seq_len={_seq_len} resp_len={len(_resp0)} resp_preview={repr(_resp0[:120])}"
+                logger.debug(
+                    "[Exp1] prompt_len=%s gen_len=%s vision_tokens_K=%s seq_len=%s resp_len=%s resp_preview=%s",
+                    prompt_len, gen_len, vision_tokens_K, _seq_len, len(_resp0), repr(_resp0[:120]),
                 )
                 _gen_len_safe = max(0, int(gen_len)) if gen_len is not None else max(0, _seq_len - pl)
                 # FLOPs: use embed-space prompt_len (LLM input seq length). For Exp1 = text + K vision tokens.
@@ -334,17 +346,12 @@ class AdaLlava(Llava):
                 results["gen_len"] = _gen_len_safe
                 if vision_tokens_K is not None:
                     results["vision_tokens_K"] = vision_tokens_K
-                # Optional debug: N (image placeholder count in input_ids), K (vision tokens after prune), prompt_len, prefill_flops
-                if os.environ.get("ADALLAVA_DEBUG_FLOPS") or os.environ.get("ADALLAVA_DEBUG"):
-                    vision_placeholder_N = getattr(self.model, "_last_vision_placeholder_N", None)
-                    eval_logger.info(
-                        f"[Exp1 FLOPs debug] N={vision_placeholder_N} K={vision_tokens_K} prompt_len={_pl} "
-                        f"prefill_flops={results.get('prefill_flops', 0):.0f}"
-                    )
-                else:
-                    eval_logger.info(
-                        f"[Exp1 FLOPs] prompt_len={_pl} vision_K={vision_tokens_K} prefill_flops={results.get('prefill_flops', 0):.0f}"
-                    )
+                # Per-sample FLOPs debug: use logger.debug(); enable with setLevel(logging.DEBUG) on this logger
+                vision_placeholder_N = getattr(self.model, "_last_vision_placeholder_N", None)
+                logger.debug(
+                    "[Exp1 FLOPs debug] N=%s K=%s prompt_len=%s prefill_flops=%s",
+                    vision_placeholder_N, vision_tokens_K, _pl, results.get("prefill_flops", 0),
+                )
 
             except Exception as e:
                 raise e

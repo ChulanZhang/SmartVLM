@@ -5,9 +5,12 @@
 #
 # Uses accelerate default (all visible GPUs). Set CUDA_VISIBLE_DEVICES to limit GPUs.
 # Optional: LIMIT=N to run only N samples per budget (for quick sweep). Omit for full eval.
+# Optional: DEBUG=1 to enable per-sample debug logs (Exp1/FLOPs). Default off.
 set -e
 
 export HF_DATASETS_DISABLE_FILE_LOCKING=1
+DEBUG="${DEBUG:-0}"
+export DEBUG
 
 MODEL="adallava"
 MODEL_ARGS_BASE="pretrained=checkpoints/ada-llava-vision-token-scheduler-v1.5-7b"

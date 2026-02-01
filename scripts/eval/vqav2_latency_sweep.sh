@@ -6,7 +6,10 @@
 # Avoid PermissionError on shared cache: disable file locking so no lock file is created.
 # Pass env inline so accelerate-launched subprocesses see it (don't change HF_DATASETS_CACHE
 # so existing shared cache is reused and data is not copied again).
+# Optional: DEBUG=1 to enable per-sample debug logs. Default off.
 export HF_DATASETS_DISABLE_FILE_LOCKING=1
+DEBUG="${DEBUG:-0}"
+export DEBUG
 
 set -e
 
@@ -16,7 +19,7 @@ TASKS="vqav2_val"
 BATCH_SIZE=1
 BASE_OUTPUT="./results/logs_latency_sweep_vqav2_val"
 
-for latency in 0.95 1.00; do
+for latency in 0.95; do
   echo "========== latency=${latency} =========="
   HF_DATASETS_DISABLE_FILE_LOCKING=1 python3 -m accelerate.commands.launch \
     -m adallava.eval.run_lmms_eval \
